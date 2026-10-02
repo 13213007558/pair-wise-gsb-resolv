@@ -122,6 +122,247 @@ class TestResolvDNS < Test::Unit::TestCase
     assert_equal 'example.com', candidates[1].to_s
   end
 
+  def zone_soa(serial, ttl = 3600)
+    Resolv::DNS::Resource::IN::SOA.new(
+      Resolv::DNS::Name.create('ns.example.org.'),
+      Resolv::DNS::Name.create('admin.example.org.'),
+      serial, 10800, 3600, 604800, 3600
+    ).tap {|resource| resource.instance_variable_set(:@ttl, ttl)}
+  end
+
+  def zone_a(name, address)
+    [Resolv::DNS::Name.create(name), 3600, Resolv::DNS::Resource::IN::A.new(address)]
+  end
+
+  def read_dns_message(io)
+    length_data = io.read(2)
+    assert_equal(2, length_data&.bytesize)
+    Resolv::DNS::Message.decode(io.read(length_data.unpack('n')[0]))
+  end
+
+  def framed_zone_response(query, records, question_type = nil)
+    reply = Resolv::DNS::Message.new(query.id)
+    reply.qr = 1
+    reply.aa = 1
+    question_name, requested_type = query.question[0]
+    reply.add_question(question_name, question_type || requested_type)
+    records.each {|record| reply.add_answer(*record)}
+    encoded = reply.encode
+    [encoded.bytesize].pack('n') << encoded
+  end
+
+  def with_zone_server(records, chunk_size, question_type: nil, message_sizes: nil)
+    with_tcp('127.0.0.1', 0) do |server|
+      _, port, _, host = server.addr
+      result = nil
+      client_error = nil
+      query = nil
+      client_thread = Thread.new do
+        begin
+          Resolv::DNS.open do |dns|
+            result = yield dns, host, port
+          end
+        rescue => client_error
+        end
+      end
+      server_thread = Thread.new do
+        client = server.accept
+        begin
+          query = read_dns_message(client)
+          if message_sizes
+            messages = message_sizes.map {|size| records.shift(size) }
+            unless records.empty?
+              raise ArgumentError, "message sizes did not consume all zone records"
+            end
+            messages.each do |message_records|
+              encoded = framed_zone_response(query, message_records, question_type)
+              0.step(encoded.bytesize, chunk_size) do |offset|
+                client.write(encoded.byteslice(offset, chunk_size))
+                sleep(0.001)
+              end
+            end
+          else
+            encoded = framed_zone_response(query, records, question_type)
+            0.step(encoded.bytesize, chunk_size) do |offset|
+              client.write(encoded.byteslice(offset, chunk_size))
+              sleep(0.001)
+            end
+          end
+        ensure
+          client.close
+        end
+      end
+      client_thread.join
+      server_thread.join
+      raise client_error if client_error
+      [result, query]
+    end
+  end
+
+  def test_axfr_assembles_split_tcp_messages
+    zone = 'example.org.'
+    start_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(100)]
+    records = [
+      start_soa,
+      zone_a('ns.example.org.', '192.0.2.10'),
+      zone_a('www.example.org.', '192.0.2.20'),
+      start_soa.dup
+    ]
+
+    result, = with_zone_server(records, 17, message_sizes: [2, 1, 1]) do |dns, host, port|
+      dns.axfr(zone, [host, port])
+    end
+
+    assert_equal('example.org', result.origin.to_s)
+    assert_equal(100, result.serial)
+    assert_equal(%w[example.org ns.example.org www.example.org], result.map {|name,| name.to_s})
+  end
+
+  def test_ixfr_applies_delete_and_add_segments
+    zone = 'example.org.'
+    old_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(100)]
+    old_zone = Resolv::DNS::Zone.new(zone, [
+      old_soa,
+      zone_a('keep.example.org.', '192.0.2.1'),
+      zone_a('gone.example.org.', '192.0.2.2')
+    ])
+    new_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(101)]
+    records = [
+      new_soa,
+      old_soa,
+      zone_a('gone.example.org.', '192.0.2.2'),
+      new_soa,
+      zone_a('added.example.org.', '192.0.2.3'),
+      new_soa.dup
+    ]
+
+    result, = with_zone_server(records, 11, message_sizes: [3, 3]) do |dns, host, port|
+      dns.ixfr(zone, old_zone, [host, port])
+    end
+
+    assert_equal(101, result.serial)
+    assert_equal(%w[example.org keep.example.org added.example.org], result.map {|name,| name.to_s})
+    assert_equal(100, old_zone.serial)
+    assert_include(old_zone.map {|name,| name.to_s}, 'gone.example.org')
+  end
+
+  def test_ixfr_accepts_axfr_fallback
+    zone = 'example.org.'
+    old_zone = Resolv::DNS::Zone.new(zone, [
+      [Resolv::DNS::Name.create(zone), 3600, zone_soa(100)],
+      zone_a('old.example.org.', '192.0.2.2')
+    ])
+    new_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(101)]
+    records = [
+      new_soa,
+      zone_a('new.example.org.', '192.0.2.3'),
+      new_soa.dup
+    ]
+
+    result, = with_zone_server(records, 23, question_type: Resolv::DNS::Resource::IN::AXFR) do |dns, host, port|
+      dns.ixfr(zone, old_zone, [host, port])
+    end
+
+    assert_equal(101, result.serial)
+    assert_equal(%w[example.org new.example.org], result.map {|name,| name.to_s})
+  end
+
+  def test_ixfr_request_contains_old_soa_authority
+    zone = 'example.org.'
+    old_zone = Resolv::DNS::Zone.new(zone, [
+      [Resolv::DNS::Name.create(zone), 3600, zone_soa(100)]
+    ])
+    new_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(100)]
+
+    result, query = with_zone_server([new_soa], 50) do |dns, host, port|
+      dns.ixfr(zone, old_zone, [host, port])
+    end
+    assert_same(old_zone, result)
+    assert_equal(Resolv::DNS::Resource::IN::IXFR::TypeValue, query.question[0][1]::TypeValue)
+    assert_equal(100, query.authority[0][2].serial)
+  end
+
+  def test_zone_transfer_rejects_records_outside_requested_zone
+    zone = 'example.org.'
+    start_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(100)]
+    records = [start_soa, zone_a('example.com.', '192.0.2.99'), start_soa.dup]
+
+    assert_raise(Resolv::DNS::ZoneTransferError) do
+      with_zone_server(records, 30) do |dns, host, port|
+        dns.axfr(zone, [host, port])
+      end
+    end
+  end
+
+  def test_zone_transfer_rejects_extra_tail_record
+    zone = 'example.org.'
+    start_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(100)]
+    records = [start_soa, zone_a('www.example.org.', '192.0.2.20'), start_soa.dup,
+               zone_a('tail.example.org.', '192.0.2.21')]
+
+    assert_raise(Resolv::DNS::ZoneTransferError) do
+      with_zone_server(records, 50) do |dns, host, port|
+        dns.axfr(zone, [host, port])
+      end
+    end
+  end
+
+  def test_zone_transfer_rejects_premature_eof
+    zone = 'example.org.'
+    records = [[Resolv::DNS::Name.create(zone), 3600, zone_soa(100)],
+               zone_a('www.example.org.', '192.0.2.20')]
+
+    assert_raise(Resolv::DNS::ZoneTransferError) do
+      with_zone_server(records, 50) do |dns, host, port|
+        dns.axfr(zone, [host, port])
+      end
+    end
+  end
+
+  def test_ixfr_rejects_bad_serial_chain_and_keeps_old_snapshot
+    zone = 'example.org.'
+    old_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(100)]
+    old_zone = Resolv::DNS::Zone.new(zone, [old_soa, zone_a('old.example.org.', '192.0.2.1')])
+    new_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(102)]
+    bad_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(101)]
+    records = [new_soa, bad_soa, new_soa, bad_soa, new_soa.dup]
+
+    assert_raise(Resolv::DNS::ZoneTransferError) do
+      with_zone_server(records, 30) do |dns, host, port|
+        dns.ixfr(zone, old_zone, [host, port])
+      end
+    end
+    assert_equal(100, old_zone.serial)
+    assert_include(old_zone.map {|name,| name.to_s}, 'old.example.org')
+  end
+
+  def test_ixfr_accepts_rfc1982_serial_wrap
+    zone = 'example.org.'
+    old_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(2**32 - 1)]
+    old_zone = Resolv::DNS::Zone.new(zone, [old_soa])
+    new_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(0)]
+    records = [new_soa, old_soa, new_soa, new_soa.dup]
+
+    result, = with_zone_server(records, 31) do |dns, host, port|
+      dns.ixfr(zone, old_zone, [host, port])
+    end
+    assert_equal(0, result.serial)
+  end
+
+  def test_ixfr_rejects_non_forward_rfc1982_serial
+    zone = 'example.org.'
+    old_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(0)]
+    old_zone = Resolv::DNS::Zone.new(zone, [old_soa])
+    new_soa = [Resolv::DNS::Name.create(zone), 3600, zone_soa(2**31)]
+    records = [new_soa, old_soa, new_soa, new_soa.dup]
+
+    assert_raise(Resolv::DNS::ZoneTransferError) do
+      with_zone_server(records, 31) do |dns, host, port|
+        dns.ixfr(zone, old_zone, [host, port])
+      end
+    end
+  end
+
   def test_conf_search
     conf = Resolv::DNS::Config.new(nameserver: '127.0.0.1')
     conf.lazy_initialize

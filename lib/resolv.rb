@@ -530,6 +530,32 @@ class Resolv
       }
     end
 
+    ##
+    # Requests an AXFR full zone transfer for +zone+ from the explicitly given
+    # +nameserver+ and returns an immutable in-memory Resolv::DNS::Zone.
+    # +nameserver+ may be a host string or a [host, port] pair.  Resolv never
+    # writes the result to the local DNS configuration.
+
+    def axfr(zone, nameserver)
+      host, port = zone_transfer_server(nameserver)
+      transfer_zone(zone, Resource::IN::AXFR, host, port)
+    end
+
+    ##
+    # Requests an IXFR incremental zone transfer for +zone+.  +old_zone+ is
+    # the current Resolv::DNS::Zone snapshot, and +nameserver+ is the explicit
+    # server to contact.  If the server answers with AXFR, that answer is
+    # parsed as a complete zone rather than as IXFR deltas.  The original
+    # snapshot is left unchanged when the transfer cannot be validated.
+
+    def ixfr(zone, old_zone, nameserver)
+      host, port = zone_transfer_server(nameserver)
+      unless Zone === old_zone
+        raise ArgumentError, "old zone must be a Resolv::DNS::Zone"
+      end
+      transfer_zone(zone, Resource::IN::IXFR, host, port, old_zone)
+    end
+
     # :stopdoc:
 
     def fetch_resource(name, typeclass)
@@ -613,6 +639,119 @@ class Resolv
       # as Resolv::DNS::Config#resolv considers ResolvTimeout exceptions as a
       # hint to try the next nameserver:
       raise ResolvTimeout
+    end
+
+    def zone_transfer_server(nameserver) # :nodoc:
+      case nameserver
+      when Array
+        unless nameserver.length == 2 &&
+               String === nameserver[0] &&
+               Integer === nameserver[1]
+          raise ArgumentError, "invalid nameserver: #{nameserver.inspect}"
+        end
+        return nameserver
+      when String
+        return nameserver, Port
+      else
+        raise ArgumentError, "invalid nameserver: #{nameserver.inspect}"
+      end
+    end
+
+    def transfer_zone(zone, typeclass, host, port, old_zone = nil) # :nodoc:
+      zone_name = absolute_zone_name(zone)
+      lazy_initialize
+      if old_zone &&
+         (old_zone.origin != zone_name || old_zone.dns_class != Resource::IN::ClassValue)
+        raise ZoneTransferError, "old zone does not match requested zone"
+      end
+      requester = make_tcp_requester(host, port)
+      records = []
+
+      begin
+        request = Message.new
+        request.add_question(zone_name, typeclass)
+        if typeclass == Resource::IN::IXFR
+          old_soa_name, old_soa_ttl, old_soa_data = old_zone.soa
+          request.add_authority(old_soa_name, old_soa_ttl, old_soa_data)
+        end
+
+        sender = requester.sender(request, nil, host, port)
+        response_type = each_zone_transfer_reply(requester, sender, zone_name, typeclass) do |reply|
+          records.concat(reply.answer)
+        end
+      rescue ZoneTransferError, DecodeError, ResolvTimeout
+        raise
+      rescue SystemCallError, IOError => e
+        raise ZoneTransferError, e.message
+      ensure
+        requester.close
+      end
+
+      begin
+        if typeclass == Resource::IN::IXFR && response_type == Resource::IN::IXFR
+          ZoneTransfer.parse_ixfr(zone_name, old_zone, records)
+        else
+          ZoneTransfer.parse_axfr(zone_name, records, old_zone&.serial)
+        end
+      rescue ZoneTransferError
+        raise
+      rescue => e
+        raise ZoneTransferError, e.message
+      end
+    end
+
+    def absolute_zone_name(zone) # :nodoc:
+      name = Name.create(zone)
+      unless name.absolute?
+        raise ArgumentError, "zone name must be absolute: #{name.to_s}"
+      end
+      name
+    end
+
+    def each_zone_transfer_reply(requester, sender, zone_name, typeclass) # :nodoc:
+      timeout = @config.timeouts&.first || Config::InitialTimeout
+      begin
+        sender.send
+      rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH, Errno::EPIPE, Errno::ECONNRESET
+        raise ResolvTimeout
+      end
+
+      response_type = nil
+      loop do
+        reply = requester.read_transfer_frame(timeout)
+        break if reply.nil?
+        unless reply.id == sender.id
+          raise ZoneTransferError, "zone transfer response id does not match request"
+        end
+        response_type = validate_zone_transfer_message(reply, zone_name, typeclass, response_type)
+        yield reply
+      end
+      response_type
+    end
+
+    def validate_zone_transfer_message(reply, zone_name, typeclass, response_type) # :nodoc:
+      unless reply.qr == 1 && reply.rcode == RCode::NoError && reply.tc.zero?
+        raise ZoneTransferError, "invalid zone transfer response"
+      end
+      questions = reply.question
+      unless questions.length == 1
+        raise ZoneTransferError, "zone transfer response must contain exactly one question"
+      end
+      reply_name, reply_type = questions[0]
+      allowed_types = typeclass == Resource::IN::IXFR ?
+        [Resource::IN::IXFR, Resource::IN::AXFR] : [typeclass]
+      unless reply_name == zone_name &&
+             allowed_types.any? {|allowed| Resource::Generic.type_class_equal?(reply_type, allowed)}
+        raise ZoneTransferError, "zone transfer response question does not match request"
+      end
+      if response_type &&
+         !Resource::Generic.type_class_equal?(reply_type, response_type)
+        raise ZoneTransferError, "zone transfer response type changed"
+      end
+      unless reply.authority.empty? && reply.additional.empty?
+        raise ZoneTransferError, "zone transfer response contains out-of-section records"
+      end
+      reply_type
     end
 
     def extract_resources(msg, name, typeclass) # :nodoc:
@@ -1000,6 +1139,16 @@ class Resolv
           @reusable = false
         end
 
+        def read_transfer_frame(timelimit)
+          deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timelimit
+          sock = @socks[0]
+          length_data = read_transfer_bytes(sock, 2, deadline) or return
+          length = length_data.unpack('n')[0]
+          data = read_transfer_bytes(sock, length, deadline)
+          raise EOFError if data.nil?
+          Message.decode(data)
+        end
+
         def recv_reply(readable_socks, timelimit = nil)
           sock = readable_socks[0]
           len_data = read_exactly(sock, 2, timelimit)
@@ -1024,10 +1173,17 @@ class Resolv
           id = DNS.allocate_request_id(@host, @port)
           request = msg.encode
           request[0,2] = [request.length, id].pack('nn')
-          return @senders[[nil,id]] = Sender.new(request, data, @socks[0])
+          return @senders[[nil,id]] = Sender.new(request, data, @socks[0], id)
         end
 
         class Sender < Requester::Sender # :nodoc:
+          attr_reader :id
+
+          def initialize(msg, data, sock, id)
+            super(msg, data, sock)
+            @id = id
+          end
+
           def send
             @sock.print(@msg)
             @sock.flush
@@ -1044,6 +1200,25 @@ class Resolv
         end
 
         private
+
+        def read_transfer_bytes(sock, length, deadline)
+          buffer = String.new
+          while buffer.bytesize < length
+            chunk = sock.read_nonblock(length - buffer.bytesize, exception: false)
+            case chunk
+            when :wait_readable
+              remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+              raise ResolvTimeout if remaining <= 0
+              sock.wait_readable(remaining) or raise ResolvTimeout
+            when nil
+              return nil if buffer.empty?
+              raise EOFError
+            else
+              buffer << chunk
+            end
+          end
+          buffer
+        end
 
         # Read +len+ bytes, giving up with ResolvTimeout once +timelimit+ (a
         # CLOCK_MONOTONIC value) has passed.  A shorter result means the peer
@@ -1077,6 +1252,13 @@ class Resolv
 
       class RequestError < StandardError
       end
+
+  end
+
+    ##
+    # Indicates that a zone transfer response was incomplete or invalid.
+
+    class ZoneTransferError < ResolvError
     end
 
     class Config # :nodoc:
@@ -1099,6 +1281,8 @@ class Resolv
           @timeouts = nil
         end
       end
+
+      attr_reader :timeouts
 
       def Config.parse_resolv_conf(filename)
         nameserver = []
@@ -2765,6 +2949,14 @@ class Resolv
         TypeValue = 255 # :nodoc:
       end
 
+      class AXFR < Query
+        TypeValue = 252 # :nodoc:
+      end
+
+      class IXFR < Query
+        TypeValue = 251 # :nodoc:
+      end
+
       ##
       # CAA resource record defined in RFC 8659
       #
@@ -2828,7 +3020,7 @@ class Resolv
       end
 
       ClassInsensitiveTypes = [ # :nodoc:
-        NS, CNAME, SOA, PTR, HINFO, MINFO, MX, TXT, LOC, ANY, CAA
+        NS, CNAME, SOA, PTR, HINFO, MINFO, MX, TXT, LOC, ANY, AXFR, IXFR, CAA
       ]
 
       ##
@@ -3103,6 +3295,222 @@ class Resolv
           ClassValue = IN::ClassValue
           ClassHash[[TypeValue, ClassValue]] = self # :nodoc:
         end
+      end
+    end
+
+    ##
+    # An immutable in-memory DNS zone snapshot returned by AXFR or IXFR.
+
+    class Zone
+      def initialize(origin, records, dns_class = Resource::IN::ClassValue)
+        origin = Name.create(origin)
+        unless origin.absolute?
+          raise ArgumentError, "zone name must be absolute: #{origin.to_s}"
+        end
+        unless dns_class == Resource::IN::ClassValue
+          raise ArgumentError, "unsupported DNS class: #{dns_class.inspect}"
+        end
+
+        records = records.map do |record|
+          ZoneTransfer.validate_record(origin, record, dns_class)
+          record.dup
+        end
+        if records.empty? || !Resource::IN::SOA.equal?(records[0][2].class)
+          raise ZoneTransferError, "zone must begin with an SOA record"
+        end
+        if records[1..-1].any? {|_, _, data| Resource::IN::SOA === data}
+          raise ZoneTransferError, "zone snapshot contains more than one SOA record"
+        end
+
+        @origin = origin
+        @dns_class = dns_class
+        @records = records
+        @records.each(&:freeze)
+        @records.freeze
+        freeze
+      end
+
+      attr_reader :origin, :dns_class
+
+      def soa
+        @records[0].dup
+      end
+
+      def serial
+        soa[2].serial
+      end
+
+      def records
+        @records.map(&:dup)
+      end
+
+      alias to_a records
+
+      def each(&block)
+        return enum_for(:each) unless block
+        @records.each {|record| yield record.dup}
+      end
+
+      include Enumerable
+    end
+
+    module ZoneTransfer # :nodoc:
+      module_function
+
+      def parse_axfr(origin, records, expected_serial = nil)
+        ensure_records(records)
+        records.each {|record| validate_record(origin, record, Resource::IN::ClassValue)}
+
+        first = records[0]
+        last = records[-1]
+        unless same_record?(first, last)
+          raise ZoneTransferError, "AXFR does not end with the opening SOA record"
+        end
+        unless records[1...-1].all? {|name, _, data| !(name == origin && Resource::IN::SOA === data)}
+          raise ZoneTransferError, "unexpected SOA record in AXFR response"
+        end
+
+        if expected_serial && first[2].serial != expected_serial
+          unless serial_greater?(first[2].serial, expected_serial)
+            raise ZoneTransferError, "AXFR serial is not newer than the current serial"
+          end
+        end
+
+        Zone.new(origin, records[0...-1])
+      end
+
+      def parse_ixfr(origin, old_zone, records)
+        unless Zone === old_zone &&
+               old_zone.origin == origin &&
+               old_zone.dns_class == Resource::IN::ClassValue
+          raise ZoneTransferError, "old zone does not match requested zone"
+        end
+
+        ensure_records(records)
+        records.each {|record| validate_record(origin, record, Resource::IN::ClassValue)}
+        new_soa = records[0]
+        current_serial = old_zone.serial
+        new_serial = new_soa[2].serial
+
+        if new_serial == current_serial
+          if records.length == 1
+            return old_zone
+          end
+          raise ZoneTransferError, "IXFR contains changes for the current serial"
+        elsif !serial_greater?(new_serial, current_serial)
+          raise ZoneTransferError, "IXFR serial went backwards"
+        end
+
+        if records.length == 1
+          raise ZoneTransferError, "premature end of IXFR transfer"
+        elsif looks_like_axfr?(records, new_soa)
+          return parse_axfr(origin, records, current_serial)
+        end
+
+        current_records = old_zone.records
+        index = 1
+
+        while index < records.length
+          base_soa = records[index]
+          unless soa_record?(origin, base_soa)
+            raise ZoneTransferError, "IXFR delta must begin with a base SOA record"
+          end
+          unless base_soa[2].serial == current_serial &&
+                 base_soa[2] == current_records[0][2]
+            raise ZoneTransferError, "IXFR base serial does not match the current zone"
+          end
+          index += 1
+
+          while index < records.length && !soa_record?(origin, records[index])
+            delete_record(current_records, records[index])
+            index += 1
+          end
+          raise ZoneTransferError, "premature end of IXFR transfer" if index >= records.length
+
+          delta_soa = records[index]
+          unless serial_greater?(delta_soa[2].serial, current_serial)
+            raise ZoneTransferError, "invalid IXFR serial chain"
+          end
+          current_serial = delta_soa[2].serial
+          current_records[0] = delta_soa.dup
+          index += 1
+
+          while index < records.length && !soa_record?(origin, records[index])
+            current_records << records[index].dup
+            index += 1
+          end
+          raise ZoneTransferError, "premature end of IXFR transfer" if index >= records.length
+
+          closing_soa = records[index]
+          index += 1
+          if same_record?(closing_soa, delta_soa)
+            if index == records.length
+              unless current_serial == new_serial && same_record?(closing_soa, new_soa)
+                raise ZoneTransferError, "invalid IXFR closing serial"
+              end
+              break
+            end
+            next
+          end
+
+          unless same_record?(closing_soa, current_records[0])
+            raise ZoneTransferError, "invalid IXFR serial chain"
+          end
+        end
+
+        unless index == records.length
+          raise ZoneTransferError, "extra records after IXFR closing SOA"
+        end
+        Zone.new(origin, current_records)
+      end
+
+      def looks_like_axfr?(records, new_soa)
+        return true unless soa_record?(new_soa[0], records[1])
+        same_record?(new_soa, records[1])
+      end
+
+      def ensure_records(records)
+        if !records.is_a?(Array) || records.empty?
+          raise ZoneTransferError, "zone transfer contained no records"
+        end
+      end
+
+      def validate_record(origin, record, dns_class)
+        unless record.is_a?(Array) && record.length == 3
+          raise ZoneTransferError, "invalid zone record: #{record.inspect}"
+        end
+        name, ttl, data = record
+        unless Name === name && name.absolute? &&
+               (name == origin || name.subdomain_of?(origin))
+          raise ZoneTransferError, "zone record is outside #{origin.to_s}"
+        end
+        unless Integer === ttl && ttl >= 0
+          raise ZoneTransferError, "invalid zone record TTL"
+        end
+        unless Resource === data && data.class.const_get(:ClassValue) == dns_class
+          raise ZoneTransferError, "zone record class does not match the zone"
+        end
+      end
+
+      def same_record?(left, right)
+        left[0] == right[0] && left[1] == right[1] && left[2] == right[2]
+      end
+
+      def soa_record?(origin, record)
+        record && record[0] == origin && Resource::IN::SOA === record[2]
+      end
+
+      def delete_record(records, record)
+        index = records.index {|name, _ttl, data| name == record[0] && data == record[2]}
+        unless index
+          raise ZoneTransferError, "IXFR deletes a record that is not in the zone"
+        end
+        records.delete_at(index)
+      end
+
+      def serial_greater?(new_serial, old_serial)
+        difference = (new_serial - old_serial) % 2**32
+        0 < difference && difference < 2**31
       end
     end
   end
