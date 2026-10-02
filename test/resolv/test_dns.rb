@@ -1228,6 +1228,88 @@ class TestResolvDNS < Test::Unit::TestCase
     [encoded.bytesize].pack('n') << encoded
   end
 
+  def zone_soa(zone, serial, ttl = 3600)
+    soa = Resolv::DNS::Resource::IN::SOA.new(
+      Resolv::DNS::Name.create('ns.' + zone),
+      Resolv::DNS::Name.create('admin.' + zone),
+      serial, 1, 2, 3, 4)
+    [zone, ttl, soa]
+  end
+
+  def zone_a(name, address, ttl = 300)
+    [name, ttl, Resolv::DNS::Resource::IN::A.new(address)]
+  end
+
+  def zone_reply(query, answers, aa: true)
+    reply = Resolv::DNS::Message.new(query.id)
+    reply.qr = 1
+    reply.aa = aa ? 1 : 0
+    query.each_question do |name, typeclass|
+      reply.add_question(name, typeclass)
+    end
+    answers.each do |name, ttl, resource|
+      reply.add_answer(name, ttl, resource)
+    end
+    reply.encode
+  end
+
+  def run_zone_transfer(records, chunk_size: 7, aa: true)
+    query = nil
+    with_tcp('127.0.0.1', 0) do |server|
+      _, port, _, host = server.addr
+      server_thread = Thread.new do
+        client = accept_within_timeout(server)
+        query = read_framed_query(client)
+        encoded = framed(zone_reply(query, records, aa: aa))
+        offset = 0
+        while offset < encoded.bytesize
+          client.write(encoded.byteslice(offset, chunk_size))
+          offset += chunk_size
+        end
+        client.close
+      end
+
+      client = Resolv::DNS::ZoneTransfer.new(host, port)
+      result = yield(client, query, host, port)
+      assert_join_threads([server_thread])
+      [result, query]
+    end
+  end
+
+  def build_zone_messages(records, split_after)
+    result = nil
+    server_query = nil
+    with_tcp('127.0.0.1', 0) do |server|
+      _, port, _, host = server.addr
+      server_thread = Thread.new do
+        client = accept_within_timeout(server)
+        server_query = read_framed_query(client)
+        first = Resolv::DNS::Message.new(server_query.id)
+        first.qr = 1
+        first.aa = 1
+        first.add_question(*server_query.question.first)
+        records.first(split_after).each {|record| first.add_answer(*record) }
+        second = Resolv::DNS::Message.new(server_query.id)
+        second.qr = 1
+        second.aa = 1
+        second.add_question(*server_query.question.first)
+        records.drop(split_after).each {|record| second.add_answer(*record) }
+        encoded = framed(first.encode) << framed(second.encode)
+        offset = 0
+        while offset < encoded.bytesize
+          client.write(encoded.byteslice(offset, 5))
+          offset += 5
+        end
+        client.close
+      end
+
+      client = Resolv::DNS::ZoneTransfer.new(host, port)
+      result = [yield(client), server_query]
+      assert_join_threads([server_thread])
+    end
+    result
+  end
+
   # Runs a TCP server which replies with +reply+ and then keeps the connection
   # open until the client side is done, so that only the timeout can end the
   # request.
@@ -1596,6 +1678,237 @@ class TestResolvDNS < Test::Unit::TestCase
         result, = assert_join_threads([client_thread, udp_server1_thread,
                                        tcp_server1_thread, tcp_server2_thread])
         assert_equal(['192.0.2.1'], result.map {|rr| rr.address.to_s })
+      end
+    end
+  end
+
+  def test_axfr_accepts_records_split_across_tcp_messages_and_bytes
+    zone = 'example.org.'
+    soa = zone_soa(zone, 10)
+    www = zone_a('www.example.org.', '192.0.2.10')
+    records = [soa, www, soa]
+
+    snapshot, query = build_zone_messages(records, 2) do |client|
+      client.axfr(zone, timeout: EnvUtil.apply_timeout_scale(5))
+    end
+
+    assert_equal(252, query.question.first[1]::TypeValue)
+    assert_equal('example.org', snapshot.zone.to_s)
+    assert_equal(10, snapshot.serial)
+    assert_equal(['example.org', 'www.example.org'],
+                 snapshot.records.map {|name, _, _| name.to_s })
+    assert_equal([10, 300], [snapshot.serial, snapshot.records.last[1]])
+    assert(snapshot.frozen?)
+  end
+
+  def test_axfr_does_not_follow_nameserver_records
+    zone = 'example.org.'
+    soa = zone_soa(zone, 10)
+    other_ns = [zone, 3600,
+                Resolv::DNS::Resource::IN::NS.new(
+                  Resolv::DNS::Name.create('192.0.2.invalid.'))]
+
+    snapshot, _ = run_zone_transfer([soa, other_ns, soa]) do |client, _|
+      client.axfr(zone, timeout: EnvUtil.apply_timeout_scale(5))
+    end
+
+    assert_equal(['example.org', 'example.org'],
+                 snapshot.records.map {|name, _, _| name.to_s })
+  end
+
+  def test_dns_axfr_uses_explicit_nameserver
+    zone = 'example.org.'
+    soa = zone_soa(zone, 10)
+
+    snapshot = nil
+    run_zone_transfer([soa, soa]) do |_, _, host, port|
+      dns = Resolv::DNS.new(nameserver: '198.51.100.1')
+      snapshot = dns.axfr(zone, [host, port], timeout: EnvUtil.apply_timeout_scale(5))
+    end
+    assert(snapshot)
+    assert_equal(10, snapshot.serial)
+  end
+
+  def test_ixfr_applies_delete_and_add_segments
+    zone = 'example.org.'
+    old_soa = zone_soa(zone, 10)
+    new_soa = zone_soa(zone, 11)
+    old_record = zone_a('www.example.org.', '192.0.2.10')
+    new_record = zone_a('www.example.org.', '192.0.2.11')
+    old_snapshot = Resolv::DNS::ZoneSnapshot.new(zone, [old_soa, old_record])
+    records = [new_soa, old_soa, old_record, new_soa, new_record, new_soa]
+
+    snapshot, query = build_zone_messages(records, 3) do |client|
+      client.ixfr(old_snapshot, timeout: EnvUtil.apply_timeout_scale(5))
+    end
+
+    assert_equal(251, query.question.first[1]::TypeValue)
+    assert_equal(snapshot.zone, query.authority.first[0])
+    assert_equal(old_soa[1], query.authority.first[1])
+    assert_equal(old_soa[2].serial, query.authority.first[2].serial)
+    assert_equal(11, snapshot.serial)
+    assert_equal(['example.org', 'www.example.org'],
+                 snapshot.records.map {|name, _, _| name.to_s })
+    assert_equal([11, '192.0.2.11'],
+                 [snapshot.serial, snapshot.records.last[2].address.to_s])
+    assert_equal(['example.org', 'www.example.org'],
+                 old_snapshot.records.map {|name, _, _| name.to_s })
+  end
+
+  def test_ixfr_recognizes_axfr_fallback
+    zone = 'example.org.'
+    old_soa = zone_soa(zone, 10)
+    new_soa = zone_soa(zone, 11)
+    new_record = zone_a('www.example.org.', '192.0.2.11')
+    old_snapshot = Resolv::DNS::ZoneSnapshot.new(zone, [old_soa])
+    records = [new_soa, new_record, new_soa]
+
+    snapshot, query = build_zone_messages(records, 1) do |client|
+      client.ixfr(old_snapshot, timeout: EnvUtil.apply_timeout_scale(5))
+    end
+
+    assert_equal(251, query.question.first[1]::TypeValue)
+    assert_equal(11, snapshot.serial)
+    assert_equal(['example.org', 'www.example.org'],
+                 snapshot.records.map {|name, _, _| name.to_s })
+  end
+
+  def test_ixfr_recognizes_minimal_axfr_fallback
+    zone = 'example.org.'
+    old_soa = zone_soa(zone, 10)
+    new_soa = zone_soa(zone, 11)
+    old_snapshot = Resolv::DNS::ZoneSnapshot.new(zone, [old_soa])
+
+    snapshot, _ = run_zone_transfer([new_soa, new_soa]) do |client, _|
+      client.ixfr(old_snapshot, timeout: EnvUtil.apply_timeout_scale(5))
+    end
+
+    assert_equal(11, snapshot.serial)
+    assert_equal(['example.org'], snapshot.records.map {|name, _, _| name.to_s })
+  end
+
+  def test_ixfr_keeps_snapshot_for_axfr_fallback_with_same_serial
+    zone = 'example.org.'
+    soa = zone_soa(zone, 10)
+    record = zone_a('www.example.org.', '192.0.2.10')
+    old_snapshot = Resolv::DNS::ZoneSnapshot.new(zone, [soa, record])
+
+    snapshot, _ = run_zone_transfer([soa, record, soa]) do |client, _|
+      client.ixfr(old_snapshot, timeout: EnvUtil.apply_timeout_scale(5))
+    end
+
+    assert_same(old_snapshot, snapshot)
+  end
+
+  def test_transfer_rejects_eof_in_next_message_after_complete_zone
+    zone = 'example.org.'
+    soa = zone_soa(zone, 10)
+    with_tcp('127.0.0.1', 0) do |server|
+      _, port, _, host = server.addr
+      server_thread = Thread.new do
+        client = accept_within_timeout(server)
+        query = read_framed_query(client)
+        reply = Resolv::DNS::Message.new(query.id)
+        reply.qr = 1
+        reply.aa = 1
+        reply.add_question(*query.question.first)
+        reply.add_answer(*soa)
+        reply.add_answer(*soa)
+        client.write(framed(reply.encode))
+        client.write([12].pack('n'))
+        client.close
+      end
+
+      assert_raise(Resolv::DNS::ZoneTransferError::ProtocolError) do
+        Resolv::DNS::ZoneTransfer.new(host, port).axfr(
+          zone, timeout: EnvUtil.apply_timeout_scale(5))
+      end
+      assert_join_threads([server_thread])
+    end
+  end
+
+  def test_ixfr_accepts_rfc1982_serial_wrap
+    zone = 'example.org.'
+    old_soa = zone_soa(zone, 0xffffffff)
+    new_soa = zone_soa(zone, 0)
+    old_snapshot = Resolv::DNS::ZoneSnapshot.new(zone, [old_soa])
+    records = [new_soa, old_soa, new_soa, new_soa]
+
+    snapshot, _ = build_zone_messages(records, 2) do |client|
+      client.ixfr(old_snapshot, timeout: EnvUtil.apply_timeout_scale(5))
+    end
+
+    assert_equal(0, snapshot.serial)
+  end
+
+  def test_axfr_rejects_early_eof_without_publishing
+    zone = 'example.org.'
+    soa = zone_soa(zone, 10)
+    old_snapshot = Resolv::DNS::ZoneSnapshot.new(zone, [soa])
+
+    assert_raise(Resolv::DNS::ZoneTransferError::ProtocolError) do
+      run_zone_transfer([soa]) do |client, _|
+        client.axfr(zone, timeout: EnvUtil.apply_timeout_scale(5))
+      end
+    end
+    assert_equal(['example.org'], old_snapshot.records.map {|name, _, _| name.to_s })
+  end
+
+  def test_ixfr_rejects_invalid_serial_chain_without_publishing
+    zone = 'example.org.'
+    old_soa = zone_soa(zone, 10)
+    bad_soa = zone_soa(zone, 12)
+    new_soa = zone_soa(zone, 13)
+    old_snapshot = Resolv::DNS::ZoneSnapshot.new(zone, [old_soa])
+    records = [new_soa, bad_soa, new_soa, new_soa]
+
+    assert_raise(Resolv::DNS::ZoneTransferError::ProtocolError) do
+      build_zone_messages(records, 2) do |client|
+        client.ixfr(old_snapshot, timeout: EnvUtil.apply_timeout_scale(5))
+      end
+    end
+    assert_equal(10, old_snapshot.serial)
+    assert_equal(['example.org'], old_snapshot.records.map {|name, _, _| name.to_s })
+  end
+
+  def test_axfr_rejects_trailing_records_after_zone_end
+    zone = 'example.org.'
+    soa = zone_soa(zone, 10)
+    trailing = zone_a('www.example.org.', '192.0.2.10')
+
+    assert_raise(Resolv::DNS::ZoneTransferError::ProtocolError) do
+      run_zone_transfer([soa, soa, trailing]) do |client, _|
+        client.axfr(zone, timeout: EnvUtil.apply_timeout_scale(5))
+      end
+    end
+  end
+
+  def test_axfr_rejects_records_outside_requested_zone
+    zone = 'example.org.'
+    soa = zone_soa(zone, 10)
+    outside = zone_a('www.example.net.', '192.0.2.10')
+
+    assert_raise(Resolv::DNS::ZoneTransferError::ProtocolError) do
+      run_zone_transfer([soa, outside, soa]) do |client, _|
+        client.axfr(zone, timeout: EnvUtil.apply_timeout_scale(5))
+      end
+    end
+  end
+
+  def test_axfr_rejects_dns_class_mismatch
+    zone = 'example.org.'
+    chaos_soa_class = Class.new(Resolv::DNS::Resource::SOA) do
+      const_set(:TypeValue, 6)
+      const_set(:ClassValue, 3)
+    end
+    soa = [zone, 3600, chaos_soa_class.new(
+      Resolv::DNS::Name.create('ns.example.org.'),
+      Resolv::DNS::Name.create('admin.example.org.'),
+      10, 1, 2, 3, 4)]
+
+    assert_raise(Resolv::DNS::ZoneTransferError::ProtocolError) do
+      run_zone_transfer([soa, soa]) do |client, _|
+        client.axfr(zone, timeout: EnvUtil.apply_timeout_scale(5))
       end
     end
   end
