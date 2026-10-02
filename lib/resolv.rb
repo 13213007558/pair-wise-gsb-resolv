@@ -1079,6 +1079,473 @@ class Resolv
       end
     end
 
+    # An iterative, injectable DNS resolver.
+    class Iterator
+      # Transport receives an Iterator::Query and returns a Message.
+      Port = DNS::Port
+
+      Delegation = Struct.new(:phase, :zone, :nameservers, :glue,
+                              :server, :source, :ports)
+      Query = Struct.new(:message, :name, :type, :server_name,
+                         :server_address, :port, :protocol, :timeout)
+      Alias = Struct.new(:phase, :owner, :target, :type)
+      Result = Struct.new(:name, :type, :rcode, :resources, :message,
+                          :delegation_chain, :alias_chain, :queries)
+
+      class Error < ResolvError
+        attr_accessor :delegation_chain, :queries, :dependencies
+      end
+
+      class QueryBudgetExceeded < Error; end
+      class NoUsableNameserver < Error; end
+      class NameserverCycle < Error; end
+      class DelegationLoop < Error; end
+      class AliasLoop < Error; end
+      class MalformedResponse < Error; end
+
+      class DefaultTransport
+        def call(request)
+          if request.protocol == :tcp
+            requester = Requester::TCP.new(request.server_address, request.port)
+          else
+            requester = Requester::ConnectedUDP.new(request.server_address, request.port)
+          end
+          begin
+            sender = requester.sender(request.message, request.name)
+            request.message.id = sender.id
+            requester.request(sender, request.timeout).first
+          ensure
+            requester.close
+          end
+        end
+      end
+
+      def initialize(root_servers:, transport: DefaultTransport.new,
+                     port: Port, timeout: 5, query_budget: 32)
+        @root_servers = normalize_root_servers(root_servers, port)
+        raise ArgumentError, "root servers are required" if @root_servers.empty?
+        raise ArgumentError, "timeout must be positive" unless timeout > 0
+        raise ArgumentError, "query budget must be positive" unless query_budget > 0
+        @transport = transport
+        @port = port
+        @timeout = timeout
+        @query_budget = query_budget
+      end
+
+      attr_reader :root_servers, :transport, :port, :timeout, :query_budget
+
+      def resolve(name, typeclass = Resource::IN::A)
+        Resolution.new(self, Name.create(name), typeclass).run
+      end
+
+      private
+
+      def normalize_root_servers(servers, default_port)
+        Array(servers).map {|server|
+          case server
+          when Array
+            address, server_port = server
+            [address.to_s, server_port || default_port]
+          else
+            [server.to_s, default_port]
+          end
+        }.freeze
+      end
+
+      class Resolution # :nodoc:
+        def initialize(iterator, name, typeclass)
+          @iterator = iterator
+          @name = absolute_name(name)
+          @typeclass = typeclass
+          @budget = iterator.query_budget
+          @queries = []
+          @wire_queries = {}
+          @next_phase = 0
+        end
+
+        def run
+          @main_chain = []
+          @active_ns_dependencies = nil
+          run_phase(@name, [], [], @main_chain, false)
+        end
+
+        private
+
+        def run_phase(initial_name, inherited_aliases, dependencies,
+                      chain, nested)
+          @active_chain = chain
+          initial_name = absolute_name(initial_name)
+          phase = @next_phase
+          @next_phase += 1
+          nested_dependencies = @active_ns_dependencies
+          active_zones = {}
+          (nested_dependencies || []).each do |zone|
+            active_zones[zone.to_s] = :dependency
+          end
+          seen_alias_owners = {}
+          inherited_aliases.each do |alias_record|
+            seen_alias_owners[alias_record.owner.to_s] = true
+          end
+          aliases = inherited_aliases.dup
+          delegation = root_delegation(phase, chain)
+          zones = [root_name]
+          qname = initial_name
+
+          loop do
+            reply, _server_name = query(qname, delegation, zones.last,
+                                       dependencies)
+
+            if authoritative_reply?(reply, qname, zones.last)
+              alias_record, next_name = alias_from_reply(
+                reply, qname, phase, seen_alias_owners)
+              if alias_record
+                aliases << alias_record
+                answer = resources_from_reply(reply, next_name)
+                return result(next_name, reply, aliases, chain, answer) unless answer.empty?
+                if same_or_subdomain?(next_name, zones.last)
+                  qname = next_name
+                  next
+                end
+                return run_phase(next_name, aliases, dependencies,
+                                 chain, nested)
+              end
+              return result(qname, reply, aliases, chain)
+            end
+
+            referral = referral_from(reply, qname, zones.last)
+            unless referral
+              raise MalformedResponse.new(
+                "non-authoritative response from #{delegation.server} for #{qname} in #{zones.last} has no referral")
+            end
+
+            zone, nameservers, glue = referral
+            active_kind = active_zones[zone.to_s]
+            if active_kind.nil? && zone != root_name &&
+               !zone.subdomain_of?(zones.last)
+              raise MalformedResponse.new(
+                "referral zone #{zone} is not below #{zones.last}")
+            end
+            if active_kind == :dependency
+              chain << Delegation.new(
+                phase, zone, nameservers, glue, delegation.server,
+                delegation.server, nil)
+              raise NameserverCycle.new(
+                "nameserver resolution depends on active zone #{zone}")
+            end
+            if active_kind
+              chain << Delegation.new(
+                phase, zone, nameservers, glue, delegation.server,
+                delegation.server, nil)
+              raise DelegationLoop.new(
+                "delegation loop at #{zone} while resolving #{@name}")
+            end
+
+            active_zones[zone.to_s] = :delegation
+            zones << zone
+            delegation = Delegation.new(
+              phase, zone, nameservers, glue, nil,
+              delegation.server, nil)
+            chain << delegation
+          end
+        rescue Error => error
+          error.delegation_chain = @main_chain.dup
+          error.queries = @queries.dup
+          error.dependencies = dependencies.map(&:to_s) unless error.dependencies
+          raise
+        ensure
+          @active_ns_dependencies = nested_dependencies unless nested
+        end
+
+        def query(qname, delegation, zone, dependencies)
+          attempted = {}
+          cycle_failures = 0
+          failure_count = 0
+          last_error = nil
+
+          servers_for(delegation, zone, dependencies).each do |server_name, address|
+            key = [qname.to_s, @typeclass, address, :udp]
+            next if attempted.key?(key)
+            attempted[key] = true
+
+            begin
+              protocol = :udp
+              reply, request_message = send_query(
+                qname, address, server_name, protocol, delegation)
+              if reply.tc == 1
+                protocol = :tcp
+                reply, request_message = send_query(
+                  qname, address, server_name, protocol, delegation)
+              end
+              validate_reply!(reply, qname, address, request_message.id)
+              if reply.tc == 1
+                raise MalformedResponse.new("TCP response from #{address} is truncated")
+              end
+              return [reply, server_name]
+            rescue StandardError => error
+              raise if QueryBudgetExceeded === error
+              last_error = error
+              failure_count += 1
+              cycle_failures += 1 if cycle_error?(error)
+            end
+          end
+
+          message = "no usable nameserver for #{qname} in #{zone}"
+          message << ": #{last_error.message}" if last_error
+          if failure_count > 0 && cycle_failures == failure_count
+            raise NameserverCycle.new(message)
+          end
+          raise NoUsableNameserver.new(message)
+        end
+
+        def servers_for(delegation, zone, dependencies)
+          Enumerator.new do |yielder|
+            delegation.nameservers.each do |server_name, known_addresses|
+              if server_name.nil?
+                known_addresses.each {|address| yielder.yield(nil, address) }
+                next
+              end
+
+              addresses = known_addresses.dup
+              if addresses.empty?
+                if same_or_subdomain?(Name.create(server_name), zone)
+                  raise NameserverCycle.new(
+                    "missing glue for in-bailiwick nameserver #{server_name} for #{zone}")
+                end
+                addresses = resolve_nameserver(server_name, zone, dependencies)
+                delegation.nameservers[server_name].concat(addresses)
+              end
+
+              addresses.each {|address| yielder.yield(server_name, address) }
+            end
+          end
+        end
+
+        def resolve_nameserver(server_name, zone, dependencies)
+          if dependencies.map(&:to_s).include?(zone.to_s)
+            raise NameserverCycle.new(
+                "nameserver #{server_name} resolution depends on #{zone}")
+          end
+
+          parent_chain = @active_chain
+          nested_chain = []
+          @active_chain = nested_chain
+          nested_dependencies = dependencies + [zone]
+          @active_ns_dependencies = nested_dependencies
+          nameserver_result = begin
+            run_phase(Name.create(server_name), [], nested_dependencies,
+                      nested_chain, true)
+          rescue Error
+            parent_chain.concat(nested_chain)
+            @active_chain = parent_chain
+            @active_ns_dependencies = dependencies
+            raise
+          end
+          parent_chain.concat(nested_chain)
+          @active_chain = parent_chain
+          @active_ns_dependencies = dependencies
+          nameserver_result.resources.map {|resource| resource.address.to_s }
+        end
+
+        def send_query(qname, address, server_name, protocol, delegation)
+          key = [qname.to_s, @typeclass, address, protocol]
+          if @wire_queries.key?(key)
+            raise QueryBudgetExceeded.new(
+              "repeated query #{qname} #{@typeclass} via #{address} #{protocol}")
+          end
+          if @budget.zero?
+            raise QueryBudgetExceeded.new(
+              "query budget exhausted while querying #{qname}")
+          end
+
+          message = Message.new
+          message.rd = 0
+          message.add_question(qname, @typeclass)
+          port = delegation.ports&.fetch(address, @iterator.port)
+          request = Query.new(
+            message, qname, @typeclass, server_name, address,
+            port, protocol, @iterator.timeout)
+          @budget -= 1
+          @wire_queries[key] = true
+          @queries << request
+          delegation.server = address
+          [@iterator.transport.call(request), message]
+        end
+
+        def validate_reply!(reply, qname, address, expected_id)
+          unless Message === reply
+            raise MalformedResponse.new("transport did not return a DNS message")
+          end
+          unless reply.id == expected_id
+            raise MalformedResponse.new("response from #{address} has wrong message id")
+          end
+          unless reply.qr == 1
+            raise MalformedResponse.new("message from #{address} is not a response")
+          end
+          unless reply.opcode == 0
+            raise MalformedResponse.new("response from #{address} has opcode #{reply.opcode}")
+          end
+          question = reply.question.first
+          unless question && absolute_name(question[0]) == qname
+            raise MalformedResponse.new(
+              "response from #{address} does not answer #{qname}")
+          end
+          unless Resource::Generic.type_class_equal?(question[1], @typeclass)
+            raise MalformedResponse.new(
+              "response from #{address} answers #{question[1]} instead of #{@typeclass}")
+          end
+          if reply.rcode == RCode::NXDomain && reply.aa != 1
+            raise MalformedResponse.new("non-authoritative NXDOMAIN from #{address}")
+          end
+          unless [RCode::NoError, RCode::NXDomain].include?(reply.rcode)
+            raise NoUsableNameserver.new(
+              "response from #{address} has rcode #{reply.rcode}")
+          end
+        end
+
+        def cycle_error?(error)
+          NameserverCycle === error
+        end
+
+        def authoritative_reply?(reply, qname, zone)
+          return false unless reply.aa == 1
+          zone == root_name ? qname == root_name : same_or_subdomain?(qname, zone)
+        end
+
+        def referral_from(reply, qname, current_zone)
+          return nil unless reply.rcode == RCode::NoError
+
+          zones = {}
+          reply.authority.each do |owner, _ttl, data|
+            next unless Resource::NS === data
+            owner = absolute_name(owner)
+            next unless same_or_subdomain?(qname, owner)
+            next unless same_or_subdomain?(owner, current_zone)
+            entry = zones[owner.to_s] ||= [owner, []]
+            entry[1] << absolute_name(data.name)
+          end
+          return nil if zones.empty?
+
+          zone, ns_names = zones.values.max_by {|owner, _| owner.length }
+          ns_names.uniq!(&:to_s)
+          nameservers = {}
+          glue = {}
+
+          ns_names.each do |ns_name|
+            ns_name = absolute_name(ns_name)
+            key = ns_name.to_s
+            if same_or_subdomain?(ns_name, zone)
+              nameservers[key] = []
+              glue[key] = []
+            else
+              nameservers[key] = []
+            end
+          end
+
+          reply.additional.each do |owner, _ttl, data|
+            owner = absolute_name(owner)
+            key = owner.to_s
+            next unless glue.key?(key)
+            address = address_from(data)
+            glue[key] << address if address
+          end
+
+          glue.each_value(&:uniq!)
+          nameservers.each do |key, _addresses|
+            nameservers[key] = glue[key].dup if glue.key?(key)
+          end
+
+          [zone, nameservers, glue]
+        end
+
+        def alias_from_reply(reply, qname, phase, seen_alias_owners)
+          cname = reply.answer.find do |owner, _ttl, data|
+            absolute_name(owner) == qname && Resource::CNAME === data
+          end
+          dname = reply.answer.select do |owner, _ttl, data|
+            absolute_name(owner) != qname && Resource::DNAME === data &&
+              same_or_subdomain?(qname, absolute_name(owner))
+          end.max_by {|owner, _ttl, _data| owner.length }
+
+          if cname && dname
+            synthesized_name = replace_name(
+              qname, absolute_name(dname[0]), absolute_name(dname[2].name))
+            unless synthesized_name == absolute_name(cname[2].name)
+              raise MalformedResponse.new(
+                "CNAME and DNAME targets disagree for #{qname}")
+            end
+          end
+
+          if dname
+            owner = absolute_name(dname[0])
+            target = absolute_name(dname[2].name)
+            next_name = replace_name(qname, owner, target)
+            type = Resource::DNAME
+          elsif cname
+            owner = absolute_name(cname[0])
+            target = absolute_name(cname[2].name)
+            next_name = target
+            type = Resource::CNAME
+          else
+            return nil
+          end
+
+          if seen_alias_owners.key?(owner.to_s)
+            raise AliasLoop.new("alias loop at #{owner} while resolving #{@name}")
+          end
+          seen_alias_owners[owner.to_s] = true
+          [Alias.new(phase, owner, target, type), next_name]
+        end
+
+        def result(qname, reply, aliases, chain, resources = nil)
+          resources ||= resources_from_reply(reply, qname)
+          Result.new(
+            qname, @typeclass, reply.rcode, resources, reply,
+            chain.dup, aliases.dup, @queries.dup)
+        end
+
+        def resources_from_reply(reply, qname)
+          reply.answer.select do |owner, _ttl, data|
+            absolute_name(owner) == qname && data.is_a?(@typeclass)
+          end.map(&:last)
+        end
+
+        def root_delegation(phase, chain)
+          addresses = @iterator.root_servers.map(&:first)
+          ports = {}
+          @iterator.root_servers.each {|address, port| ports[address] = port }
+          delegation = Delegation.new(
+            phase, root_name, {nil => addresses.dup},
+            {nil => addresses.dup}, addresses.first, nil, ports)
+          chain << delegation
+          delegation
+        end
+
+        def address_from(data)
+          case data
+          when Resource::IN::A, Resource::IN::AAAA
+            data.address.to_s
+          end
+        end
+
+        def same_or_subdomain?(name, zone)
+          name == zone || name.subdomain_of?(zone)
+        end
+
+        def replace_name(qname, owner, target)
+          prefix = qname.to_a.first(qname.length - owner.length)
+          Name.new(prefix + target.to_a, true)
+        end
+
+        def root_name
+          @root_name ||= Name.new([], true)
+        end
+
+        def absolute_name(name)
+          Name.new(name.to_a, true)
+        end
+      end
+    end
+
     class Config # :nodoc:
       def initialize(config_info=nil)
         @mutex = Thread::Mutex.new
@@ -2446,6 +2913,13 @@ class Resolv
       end
 
       ##
+      # A delegation name.
+
+      class DNAME < DomainName
+        TypeValue = 39 # :nodoc:
+      end
+
+      ##
       # Start Of Authority resource.
 
       class SOA < Resource
@@ -2828,7 +3302,7 @@ class Resolv
       end
 
       ClassInsensitiveTypes = [ # :nodoc:
-        NS, CNAME, SOA, PTR, HINFO, MINFO, MX, TXT, LOC, ANY, CAA
+        NS, CNAME, DNAME, SOA, PTR, HINFO, MINFO, MX, TXT, LOC, ANY, CAA
       ]
 
       ##
