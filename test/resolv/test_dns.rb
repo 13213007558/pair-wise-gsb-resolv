@@ -646,6 +646,173 @@ class TestResolvDNS < Test::Unit::TestCase
     assert_kind_of(ArgumentError, e.cause)
   end
 
+  def test_encode_with_size_limit_selects_rrsets_by_priority
+    message = size_limited_message
+    ids = size_limited_rrset_ids
+    assert_equal(77, message.encode.bytesize)
+
+    priorities = [ids[:generic100], ids[:txt], ids[:generic99]]
+
+    (29..77).each do |limit|
+      encoded = message.encode_with_size_limit(limit, priorities)
+      _id, flags, qdcount, ancount, nscount, arcount = encoded.unpack("nnnnnn")
+      decoded = Resolv::DNS::Message.decode(encoded)
+      parsed = decode_limited_message_records(encoded)
+      selected_types = parsed.answer.map {|_name, _ttl, data| data.class::TypeValue }
+
+      if limit < 49
+        assert_equal([], selected_types, "limit #{limit}")
+        assert_equal(29, encoded.bytesize, "limit #{limit}")
+      elsif limit < 63
+        assert_equal([100], selected_types, "limit #{limit}")
+        assert_equal(49, encoded.bytesize, "limit #{limit}")
+      elsif limit < 77
+        assert_equal([16, 100], selected_types, "limit #{limit}")
+        assert_equal(63, encoded.bytesize, "limit #{limit}")
+      else
+        assert_equal([16, 99, 100], selected_types, "limit #{limit}")
+        assert_equal(77, encoded.bytesize, "limit #{limit}")
+      end
+
+      assert_equal(1, qdcount)
+      assert_equal(selected_types.length, ancount)
+      assert_equal(0, nscount)
+      assert_equal(0, arcount)
+      assert_equal(limit < 77 ? 1 : 0, (flags >> 9) & 1)
+      assert_equal(1, parsed.question.length)
+      assert_equal(selected_types.length, parsed.answer.length)
+      assert_equal(0, parsed.authority.length)
+      assert_equal(0, parsed.additional.length)
+      assert_equal(limit < 77 ? 1 : 0, decoded.tc)
+      assert_operator(encoded.bytesize, :<=, limit)
+    end
+
+    assert_raise(Resolv::DNS::EncodeError) do
+      message.encode_with_size_limit(28, priorities)
+    end
+  end
+
+  def test_encode_with_size_limit_maximizes_same_priority_in_original_order
+    message = size_limited_message
+
+    encoded = message.encode_with_size_limit(49)
+    decoded = decode_limited_message_records(encoded)
+    assert_equal([16], decoded.answer.map {|_name, _ttl, data| data.class::TypeValue})
+
+    encoded = message.encode_with_size_limit(63)
+    decoded = decode_limited_message_records(encoded)
+    assert_equal([16, 99], decoded.answer.map {|_name, _ttl, data| data.class::TypeValue})
+  end
+
+  def test_encode_with_size_limit_keeps_rrset_and_required_combination_atomic
+    message = Resolv::DNS::Message.new(0)
+    message.qr = 1
+    message.add_question("example.org.", Resolv::DNS::Resource::IN::A)
+    message.add_answer("alpha.example.org.", 3600, Resolv::DNS::Resource::IN::TXT.new("a"))
+    message.add_answer("alpha.example.org.", 3600, Resolv::DNS::Resource::IN::TXT.new("b"))
+    generic99 = Resolv::DNS::Resource::Generic.create(99, 1)
+    generic100 = Resolv::DNS::Resource::Generic.create(100, 1)
+    generic46 = Resolv::DNS::Resource::Generic.create(46, 1)
+    message.add_answer("alpha.example.org.", 3600, generic99.new("aa"))
+    message.add_answer("alpha.example.org.", 3600, generic100.new("bb"))
+    message.add_answer("alpha.example.org.", 3600, generic46.new("sig"))
+
+    encoded = message.encode_with_size_limit(49)
+    decoded = decode_limited_message_records(encoded)
+    assert_equal([99], decoded.answer.map {|_name, _ttl, data| data.class::TypeValue})
+
+    encoded = message.encode_with_size_limit(63)
+    decoded = decode_limited_message_records(encoded)
+    assert_equal([99, 100], decoded.answer.map {|_name, _ttl, data| data.class::TypeValue})
+
+    rrsig = ["alpha.example.org.", 46, 1]
+    txt = ["alpha.example.org.", 16, 1]
+    assert_raise(Resolv::DNS::EncodeError) do
+      message.encode_with_size_limit(49, required: [[rrsig, txt]])
+    end
+
+    encoded = message.encode_with_size_limit(78, required: [[rrsig, txt]])
+    decoded = decode_limited_message_records(encoded)
+    assert_equal([16, 16, 46], decoded.answer.map {|_name, _ttl, data| data.class::TypeValue}.sort)
+  end
+
+  def test_encode_with_size_limit_rebuilds_compression_and_preserves_message
+    message = size_limited_message
+    ids = size_limited_rrset_ids
+    original = message.encode
+    original_answers = message.answer.dup
+
+    encoded = message.encode_with_size_limit(49, [ids[:generic99]])
+    decoded = decode_limited_message_records(encoded)
+    assert_equal(["alpha.example.org"], decoded.answer.map {|name, _ttl, _data| name.to_s })
+    assert_equal([99], decoded.answer.map {|_name, _ttl, data| data.class::TypeValue })
+    assert_equal(49, encoded.bytesize)
+    assert_equal(1, Resolv::DNS::Message.decode(message.encode_with_size_limit(49, [ids[:generic99]])).tc)
+
+    assert_equal(original, message.encode)
+    assert_equal(original_answers, message.answer)
+    assert_equal(0, message.tc)
+  end
+
+  def test_encode_with_size_limit_recalculates_compression_pointers
+    message = Resolv::DNS::Message.new(0)
+    message.qr = 1
+    message.add_question("example.org.", Resolv::DNS::Resource::IN::A)
+    dropped = ["shared.alpha.example.org.", 16, 1]
+    retained = ["other.alpha.example.org.", 99, 1]
+    message.add_answer(dropped[0], 3600, Resolv::DNS::Resource::IN::TXT.new("a"))
+    message.add_answer(retained[0], 3600, Resolv::DNS::Resource::Generic.create(99, 1).new("aa"))
+
+    encoded = message.encode_with_size_limit(63, [[retained]])
+    decoded = decode_limited_message_records(encoded)
+
+    assert_equal(1, decoded.answer.length)
+    assert_equal("other.alpha.example.org", decoded.answer.first.first.to_s)
+    assert_not_match(/shared/, encoded.delete("\0"))
+  end
+
+  def test_encode_with_size_limit_preserves_sections_for_cross_section_rrset
+    message = Resolv::DNS::Message.new(0)
+    message.qr = 1
+    message.add_question("example.org.", Resolv::DNS::Resource::IN::A)
+    message.add_answer("alpha.example.org.", 3600, Resolv::DNS::Resource::IN::TXT.new("a"))
+    message.add_authority("alpha.example.org.", 3600, Resolv::DNS::Resource::IN::TXT.new("b"))
+    message.add_additional("other.example.org.", 3600, Resolv::DNS::Resource::IN::TXT.new("c"))
+
+    encoded = message.encode_with_size_limit(63)
+    _id, _flags, qdcount, ancount, nscount, arcount = encoded.unpack("nnnnnn")
+    decoded = decode_limited_message_records(encoded)
+
+    assert_equal(1, qdcount)
+    assert_equal(1, ancount)
+    assert_equal(1, nscount)
+    assert_equal(0, arcount)
+    assert_equal(1, decoded.answer.length)
+    assert_equal(1, decoded.authority.length)
+    assert_equal(0, decoded.additional.length)
+  end
+
+  def test_encode_with_size_limit_keeps_priority_group_atomic
+    message = size_limited_message
+    ids = size_limited_rrset_ids
+    rrsig = ["alpha.example.org.", 46, 1]
+    generic46 = Resolv::DNS::Resource::Generic.create(46, 1)
+    message.add_answer("alpha.example.org.", 3600, generic46.new("sig"))
+
+    priorities = [
+      {group: [rrsig, ids[:txt]]},
+      [ids[:generic99], ids[:generic100]]
+    ]
+
+    encoded = message.encode_with_size_limit(63, priorities)
+    decoded = decode_limited_message_records(encoded)
+    assert_equal([99, 100], decoded.answer.map {|_name, _ttl, data| data.class::TypeValue}.sort)
+
+    encoded = message.encode_with_size_limit(69, priorities)
+    decoded = decode_limited_message_records(encoded)
+    assert_equal([16, 46], decoded.answer.map {|_name, _ttl, data| data.class::TypeValue}.sort)
+  end
+
   def test_too_big_label_address
     n = 2000
     m = Resolv::DNS::Message::MessageEncoder.new {|msg|
@@ -867,6 +1034,34 @@ class TestResolvDNS < Test::Unit::TestCase
     assert_raise_with_message(ArgumentError, /character-string is too long/) do
       Resolv::DNS::Message::MessageEncoder.new {|msg| msg.put_string("a" * 256) }
     end
+  end
+
+  private
+
+  def decode_limited_message_records(encoded)
+    parseable = encoded.dup
+    parseable.setbyte(2, parseable.getbyte(2) & ~0x02)
+    Resolv::DNS::Message.decode(parseable)
+  end
+
+  def size_limited_message
+    message = Resolv::DNS::Message.new(0)
+    message.qr = 1
+    message.add_question("example.org.", Resolv::DNS::Resource::IN::A)
+    message.add_answer("alpha.example.org.", 3600, Resolv::DNS::Resource::IN::TXT.new("a"))
+    generic99 = Resolv::DNS::Resource::Generic.create(99, 1)
+    generic100 = Resolv::DNS::Resource::Generic.create(100, 1)
+    message.add_answer("alpha.example.org.", 3600, generic99.new("aa"))
+    message.add_answer("alpha.example.org.", 3600, generic100.new("bb"))
+    message
+  end
+
+  def size_limited_rrset_ids
+    {
+      txt: ["alpha.example.org.", 16, 1],
+      generic99: ["alpha.example.org.", 99, 1],
+      generic100: ["alpha.example.org.", 100, 1]
+    }
   end
 
   def assert_no_fd_leak

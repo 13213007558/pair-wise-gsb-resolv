@@ -1608,35 +1608,56 @@ class Resolv
       end
 
       def encode
-        return MessageEncoder.new {|msg|
-          msg.put_pack('nnnnnn',
-            @id,
-            (@qr & 1) << 15 |
-            (@opcode & 15) << 11 |
-            (@aa & 1) << 10 |
-            (@tc & 1) << 9 |
-            (@rd & 1) << 8 |
-            (@ra & 1) << 7 |
-            (@rcode & 15),
-            @question.length,
-            @answer.length,
-            @authority.length,
-            @additional.length)
-          @question.each {|q|
-            name, typeclass = q
-            msg.put_name(name)
-            msg.put_pack('nn', typeclass::TypeValue, typeclass::ClassValue)
-          }
-          [@answer, @authority, @additional].each {|rr|
-            rr.each {|r|
-              name, ttl, data = r
-              msg.put_name(name)
-              msg.put_pack('nnN', data.class::TypeValue, data.class::ClassValue, ttl)
-              msg.put_length16 {data.encode_rdata(msg)}
-            }
-          }
-        }.to_s
+        return encode_message(@question, @answer, @authority, @additional, @tc)
       end
+
+      # Encodes a response that must fit into +max_size+ bytes.  Resource
+      # records are selected as complete RRsets (same owner, class and type);
+      # the encoded message is regenerated rather than byte-truncated.
+      # +priorities+ is an array of tiers from highest to lowest priority.  A
+      # tier is one RRset id or an array of units.  Each unit is either an RRset
+      # id or {group: [id, ...]}, which keeps several RRsets together.  A tier
+      # array lists independent units at the same priority.  +required+
+      # identifies one mandatory RRset id or an array of ids that form one
+      # mandatory combination.  TC is set when records are omitted.
+      def encode_with_size_limit(max_size, priorities = nil, legacy_required = nil, options = nil, required: nil)
+        max_size = max_size.to_int
+        raise ArgumentError, "max size must be positive" if max_size <= 0
+        required = legacy_required if legacy_required
+        config = options
+        config = priorities if priorities.is_a?(Hash) && (priorities.key?(:priorities) || priorities.key?(:required))
+        if config
+          priorities = config[:priorities]
+          required = config.key?(:required) ? config[:required] : required
+        end
+
+        groups = rrset_groups
+        ids = groups.each_with_object({}) {|group, result| result[rrset_id(group.key)] = group }
+        required_combinations = normalize_required_rrsets(required, ids)
+        units = build_rrset_units(groups, priorities, required_combinations)
+        units_by_key = {}
+        units.each {|unit| unit.keys.each {|key| units_by_key[key] = unit } }
+        required_units = required_combinations.map {|combination| units_by_key.fetch(combination.first)}
+        selected_units = required_units.uniq
+
+        raise EncodeError, "required DNS records do not fit in #{max_size} bytes" unless
+          message_fits?(groups, selected_units, max_size)
+
+        units_by_priority = units.group_by(&:priority).sort_by {|priority, _| -priority }
+        units_by_priority.each {|_priority, same_priority|
+          optional = same_priority.reject {|unit| selected_units.include?(unit) }
+          selected_units.concat(fit_most_units(groups, selected_units, optional, max_size))
+        }
+
+        selected_keys = selected_units.flat_map(&:keys)
+        omitted = groups.any? {|group| !selected_keys.include?(rrset_id(group.key)) }
+        bytes = encode_message_for_units(groups, selected_units, omitted ? 1 : @tc)
+        raise EncodeError, "DNS message does not fit in #{max_size} bytes" if bytes.bytesize > max_size
+        return bytes
+      end
+
+      alias encode_with_limit encode_with_size_limit
+      alias limited_encode encode_with_size_limit
 
       class MessageEncoder # :nodoc:
         def initialize
@@ -1717,6 +1738,196 @@ class Resolv
           end
           self.put_string(s)
         end
+      end
+
+      RRsetRecord = Struct.new(:record, :section) # :nodoc:
+      RRsetGroup = Struct.new(:key, :records, :order) # :nodoc:
+      RRsetUnit = Struct.new(:keys, :order, :priority) # :nodoc:
+
+      private
+
+      def encode_message(questions, answers, authorities, additionals, tc)
+        return MessageEncoder.new {|msg|
+          msg.put_pack('nnnnnn',
+            @id,
+            (@qr & 1) << 15 |
+            (@opcode & 15) << 11 |
+            (@aa & 1) << 10 |
+            (tc & 1) << 9 |
+            (@rd & 1) << 8 |
+            (@ra & 1) << 7 |
+            (@rcode & 15),
+            questions.length,
+            answers.length,
+            authorities.length,
+            additionals.length)
+          questions.each {|q|
+            name, typeclass = q
+            msg.put_name(name)
+            msg.put_pack('nn', typeclass::TypeValue, typeclass::ClassValue)
+          }
+          [answers, authorities, additionals].each {|rr|
+            rr.each {|r|
+              name, ttl, data = r
+              msg.put_name(name)
+              msg.put_pack('nnN', data.class::TypeValue, data.class::ClassValue, ttl)
+              msg.put_length16 {data.encode_rdata(msg)}
+            }
+          }
+        }.to_s
+      end
+
+      def rrset_groups
+        groups = {}
+        [[@answer, :answer], [@authority, :authority], [@additional, :additional]].each {|records, section|
+          records.each {|record|
+            name, _ttl, data = record
+            key = [name, data.class::TypeValue, data.class::ClassValue]
+            group = groups[key]
+            unless group
+              group = RRsetGroup.new(key, [], groups.size)
+              groups[key] = group
+            end
+            group.records << RRsetRecord.new(record, section)
+          }
+        }
+        return groups.values
+      end
+
+      def build_rrset_units(groups, priorities, required_combinations)
+        ids = groups.each_with_object({}) {|group, result| result[rrset_id(group.key)] = group }
+        units = []
+        key_to_unit = {}
+        add_unit = lambda {|keys, priority|
+          keys.each {|key|
+            raise ArgumentError, "RRset #{key.inspect} appears in more than one priority unit" if
+              key_to_unit.key?(key)
+          }
+          order = keys.map {|key| ids.fetch(key).order }.min
+          unit = RRsetUnit.new(keys, order, priority)
+          units << unit
+          keys.each {|key| key_to_unit[key] = unit }
+        }
+
+        Array(priorities).each_with_index {|tier, tier_index|
+          priority = -tier_index
+          priority_entries(tier).each {|entry|
+            unit_keys = rrset_unit_keys(entry, ids)
+            unit_keys.each {|key| raise ArgumentError, "unknown RRset #{key.inspect}" unless ids.key?(key) }
+            add_unit.call(unit_keys, priority)
+          }
+        }
+
+        required_combinations.each {|keys|
+          keys.each {|key|
+            unit = key_to_unit[key]
+            raise ArgumentError, "required RRset #{key.inspect} conflicts with priority grouping" if
+              unit && unit.keys != keys
+          }
+          next if keys.first && key_to_unit.key?(keys.first)
+          add_unit.call(keys, -1000)
+        }
+
+        groups.each {|group|
+          key = rrset_id(group.key)
+          next if key_to_unit.key?(key)
+          add_unit.call([key], -1000)
+        }
+
+        units.sort_by {|unit| [-unit.priority, unit.order] }
+      end
+
+      def priority_entries(tier)
+        return [tier] if rrset_identifier?(tier)
+        return [tier] if tier.is_a?(Hash)
+        return Array(tier) if tier.is_a?(Array)
+        raise ArgumentError, "invalid priority unit #{tier.inspect}"
+      end
+
+      def rrset_unit_keys(entry, ids)
+        return [normalize_rrset_key(entry, ids)] if rrset_identifier?(entry)
+        if entry.is_a?(Hash)
+          group = entry.fetch(:group) { raise ArgumentError, "priority unit must include :group" }
+          return Array(group).map {|key| normalize_rrset_key(key, ids) }
+        end
+        Array(entry).map {|key| normalize_rrset_key(key, ids) }
+      end
+
+      def rrset_identifier?(entry)
+        entry.is_a?(Array) && (entry.length == 2 || entry.length == 3) && !entry.first.is_a?(Array)
+      end
+
+      def normalize_required_rrsets(required, ids)
+        return [] unless required
+        Array(required).map {|entry|
+          keys = !entry.is_a?(Array) || rrset_identifier?(entry) ?
+            rrset_unit_keys(entry, ids) :
+            entry.map {|key| normalize_rrset_key(key, ids)}
+          keys.each {|key|
+            raise ArgumentError, "unknown required RRset #{key.inspect}" unless ids.key?(key)
+          }
+          raise ArgumentError, "empty required RRset combination" if keys.empty?
+          keys
+        }.uniq
+      end
+
+      def normalize_rrset_key(key, ids)
+        name, type, class_value = key
+        name = Name.create(name)
+        if class_value.nil?
+          class_value = type.is_a?(Integer) ? Resource::IN::ClassValue : type::ClassValue
+        end
+        type = type.is_a?(Integer) ? type : type::TypeValue
+        class_value = class_value.is_a?(Integer) ? class_value : class_value::ClassValue
+        normalized = rrset_id([name, type, class_value])
+        if ids && !ids.key?(normalized)
+          raise ArgumentError, "unknown RRset #{normalized.inspect}"
+        end
+        normalized
+      end
+
+      def rrset_id(key)
+        name, type, class_value = key
+        [name.to_s, type.to_int, class_value.to_int]
+      end
+
+      def message_fits?(groups, units, max_size)
+        encode_message_for_units(groups, units, @tc).bytesize <= max_size
+      end
+
+      def fit_most_units(groups, selected, optional, max_size)
+        options = (1..optional.length).flat_map {|count| optional.combination(count).to_a }
+        options.sort_by! {|candidate|
+          group_count = candidate.inject(0) {|count, unit| count + unit.keys.length}
+          candidate_keys = candidate.flat_map(&:keys)
+          order = groups.map {|group|
+            candidate_keys.include?(rrset_id(group.key)) ? 0 : 1
+          }
+          [-group_count, order]
+        }
+        options.each {|candidate|
+          return candidate if message_fits?(groups, selected + candidate, max_size)
+        }
+        []
+      end
+
+      def encode_message_for_units(groups, units, tc)
+        selected_keys = units.flat_map(&:keys)
+        answers = []
+        authorities = []
+        additionals = []
+        groups.each {|group|
+          key = rrset_id(group.key)
+          next unless selected_keys.include?(key)
+          group.records.each {|entry|
+            case entry.section
+            when :answer then answers << entry.record
+            when :authority then authorities << entry.record
+            when :additional then additionals << entry.record
+            end
+          }
+        }
+        encode_message(@question, answers, authorities, additionals, tc)
       end
 
       def Message.decode(m)
