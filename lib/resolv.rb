@@ -760,7 +760,7 @@ class Resolv
           end
           begin
             msg = Message.decode(reply)
-          rescue DecodeError
+          rescue Resolv::DNS::DecodeError
             next # broken DNS message ignored
           end
           if sender == sender_for(from, msg)
@@ -1639,9 +1639,10 @@ class Resolv
       end
 
       class MessageEncoder # :nodoc:
-        def initialize
+        def initialize(options = {})
           @data = ''.dup
           @names = {}
+          @canonical = options[:canonical] || false
           yield self
         end
 
@@ -1684,27 +1685,28 @@ class Resolv
           }
         end
 
-        def put_name(d, compress: true)
-          put_labels(d.to_a, compress: compress)
+        def put_name(d, compress: true, canonical: @canonical)
+          compress = false if canonical
+          put_labels(d.to_a, compress: compress, canonical: canonical)
         end
 
-        def put_labels(d, compress: true)
+        def put_labels(d, compress: true, canonical: @canonical)
           d.each_index {|i|
             domain = d[i..-1]
-            if compress && idx = @names[domain]
+            if !canonical && compress && idx = @names[domain]
               self.put_pack("n", 0xc000 | idx)
               return
             else
-              if @data.length < 0x4000
+              if !canonical && @data.length < 0x4000
                 @names[domain] = @data.length
               end
-              self.put_label(d[i])
+              self.put_label(d[i], canonical)
             end
           }
           @data << "\0"
         end
 
-        def put_label(d)
+        def put_label(d, canonical = @canonical)
           s = d.to_s
           # Label::Str applies this limit when a label is built, so what is left
           # for here is a raw string handed straight to put_labels. The two ways
@@ -1715,6 +1717,7 @@ class Resolv
           if s.bytesize > 63
             raise ArgumentError, "DNS label is too long (#{s.bytesize} bytes, max 63): #{s.inspect}"
           end
+          s = s.b.downcase if canonical
           self.put_string(s)
         end
       end
@@ -2446,6 +2449,32 @@ class Resolv
       end
 
       ##
+      # Delegation Signer resource.
+
+      class DS < Resource
+        TypeValue = 43 # :nodoc:
+
+        def initialize(key_tag, algorithm, digest_type, digest)
+          @key_tag = key_tag
+          @algorithm = algorithm
+          @digest_type = digest_type
+          @digest = digest
+        end
+
+        attr_reader :key_tag, :algorithm, :digest_type, :digest
+
+        def encode_rdata(msg) # :nodoc:
+          msg.put_pack('nCC', @key_tag, @algorithm, @digest_type)
+          msg.put_bytes(@digest)
+        end
+
+        def self.decode_rdata(msg) # :nodoc:
+          key_tag, algorithm, digest_type = msg.get_unpack('nCC')
+          self.new(key_tag, algorithm, digest_type, msg.get_bytes)
+        end
+      end
+
+      ##
       # Start Of Authority resource.
 
       class SOA < Resource
@@ -2827,8 +2856,173 @@ class Resolv
         end
       end
 
+      ##
+      # A DNSKEY resource. [RFC 4034]
+
+      class DNSKEY < Resource
+        TypeValue = 48
+
+        def initialize(flags, protocol, algorithm, public_key)
+          @flags = flags
+          @protocol = protocol
+          @algorithm = algorithm
+          @public_key = public_key
+        end
+
+        attr_reader :flags, :protocol, :algorithm, :public_key
+
+        def encode_rdata(msg) # :nodoc:
+          msg.put_pack('nCC', @flags, @protocol, @algorithm)
+          msg.put_bytes(@public_key)
+        end
+
+        def self.decode_rdata(msg) # :nodoc:
+          flags, protocol, algorithm = msg.get_unpack('nCC')
+          return self.new(flags, protocol, algorithm, msg.get_bytes)
+        end
+      end
+
+      ##
+      # An RRSIG resource. [RFC 4034]
+
+      class RRSIG < Resource
+        TypeValue = 46
+
+        def initialize(type_covered, algorithm, labels, original_ttl,
+                       expiration, inception, key_tag, signer, signature)
+          @type_covered = type_covered
+          @algorithm = algorithm
+          @labels = labels
+          @original_ttl = original_ttl
+          @expiration = expiration
+          @inception = inception
+          @key_tag = key_tag
+          @signer = signer
+          @signature = signature
+        end
+
+        attr_reader :type_covered, :algorithm, :labels, :original_ttl,
+                    :expiration, :inception, :key_tag, :signer, :signature
+
+        def encode_rdata(msg) # :nodoc:
+          msg.put_pack('nCCNNNn',
+                       @type_covered, @algorithm, @labels, @original_ttl,
+                       @expiration, @inception, @key_tag)
+          msg.put_name(@signer, compress: false)
+          msg.put_bytes(@signature)
+        end
+
+        def self.decode_rdata(msg) # :nodoc:
+          type_covered, algorithm, labels, original_ttl,
+            expiration, inception, key_tag = msg.get_unpack('nCCNNNn')
+          signer = msg.get_name
+          signature = msg.get_bytes
+          return self.new(type_covered, algorithm, labels, original_ttl,
+                          expiration, inception, key_tag, signer, signature)
+        end
+      end
+
+      ##
+      # An NSEC resource. [RFC 4034]
+
+      class NSEC < Resource
+        TypeValue = 47
+
+        def initialize(next_domain, types)
+          @next_domain = next_domain
+          @types = types.uniq.sort
+        end
+
+        attr_reader :next_domain, :types
+
+        def encode_rdata(msg) # :nodoc:
+          msg.put_name(@next_domain, compress: false)
+          msg.put_bytes(DNSSEC.encode_type_bitmap(@types))
+        end
+
+        def self.decode_rdata(msg) # :nodoc:
+          next_domain = msg.get_name
+          types = DNSSEC.decode_type_bitmap(msg.get_bytes)
+          return self.new(next_domain, types)
+        end
+      end
+
+      ##
+      # An NSEC3 resource. [RFC 5155]
+
+      class NSEC3 < Resource
+        TypeValue = 50
+
+        def initialize(hash_algorithm, flags, iterations, salt,
+                       next_hashed_owner, types)
+          @hash_algorithm = hash_algorithm
+          @flags = flags
+          @iterations = iterations
+          @salt = salt
+          @next_hashed_owner = next_hashed_owner
+          @types = types.uniq.sort
+        end
+
+        attr_reader :hash_algorithm, :flags, :iterations, :salt,
+                    :next_hashed_owner, :types
+
+        def opt_out?
+          (@flags & 1) == 1
+        end
+
+        def encode_rdata(msg) # :nodoc:
+          msg.put_pack('CCnC', @hash_algorithm, @flags, @iterations,
+                       @salt.bytesize)
+          msg.put_bytes(@salt)
+          msg.put_pack('C', @next_hashed_owner.bytesize)
+          msg.put_bytes(@next_hashed_owner)
+          msg.put_bytes(DNSSEC.encode_type_bitmap(@types))
+        end
+
+        def self.decode_rdata(msg) # :nodoc:
+          hash_algorithm, flags, iterations, salt_length =
+            msg.get_unpack('CCnC')
+          salt = msg.get_bytes(salt_length)
+          hash_length, = msg.get_unpack('C')
+          next_hashed_owner = msg.get_bytes(hash_length)
+          types = DNSSEC.decode_type_bitmap(msg.get_bytes)
+          return self.new(hash_algorithm, flags, iterations, salt,
+                          next_hashed_owner, types)
+        end
+      end
+
+      ##
+      # An NSEC3PARAM resource. [RFC 5155]
+
+      class NSEC3PARAM < Resource
+        TypeValue = 51
+
+        def initialize(hash_algorithm, flags, iterations, salt)
+          @hash_algorithm = hash_algorithm
+          @flags = flags
+          @iterations = iterations
+          @salt = salt
+        end
+
+        attr_reader :hash_algorithm, :flags, :iterations, :salt
+
+        def encode_rdata(msg) # :nodoc:
+          msg.put_pack('CCnC', @hash_algorithm, @flags, @iterations,
+                       @salt.bytesize)
+          msg.put_bytes(@salt)
+        end
+
+        def self.decode_rdata(msg) # :nodoc:
+          hash_algorithm, flags, iterations, salt_length =
+            msg.get_unpack('CCnC')
+          return self.new(hash_algorithm, flags, iterations,
+                          msg.get_bytes(salt_length))
+        end
+      end
+
       ClassInsensitiveTypes = [ # :nodoc:
-        NS, CNAME, SOA, PTR, HINFO, MINFO, MX, TXT, LOC, ANY, CAA
+        NS, CNAME, DS, SOA, PTR, HINFO, MINFO, MX, TXT, LOC, ANY, CAA,
+        DNSKEY, RRSIG, NSEC, NSEC3, NSEC3PARAM
       ]
 
       ##
@@ -3104,7 +3298,877 @@ class Resolv
           ClassHash[[TypeValue, ClassValue]] = self # :nodoc:
         end
       end
+
+      # Offline DNSSEC validation helpers.
+
+      module DNSSEC
+        # Validates the authenticated denial-of-existence parts of an offline
+        # DNS response. The caller supplies a message or wire-format response,
+        # the question name/type, and DNSKEY records that are already trusted.
+        #
+        # The returned NegativeResult separates the denial proof from RRSIG
+        # verification: a response may have a plausible NSEC/NSEC3 interval
+        # while still failing signature validation, and vice versa.
+
+        Algorithm = {
+          5 => [:rsa_sha1, 'sha1'],
+          7 => [:rsa_sha1_nsec3, 'sha1'],
+          8 => [:rsa_sha256, 'sha256'],
+          10 => [:rsa_sha512, 'sha512'],
+          13 => [:ecdsa_p256_sha256, 'sha256', 64],
+          14 => [:ecdsa_p384_sha384, 'sha384', 96],
+          15 => [:ed25519, nil, 32],
+          16 => [:ed448, nil, 57]
+        }
+
+        NegativeResult = Struct.new(:status, :proven, :reason, :zone,
+                                    :wildcard, :records, :signatures)
+        SignatureResult = Struct.new(:valid, :checked, :failures)
+        class NegativeResult
+          alias proven? proven
+          alias wildcard? wildcard
+        end
+        class SignatureResult
+          alias valid? valid
+        end
+
+        class VerificationError < StandardError
+        end
+
+        def self.type_value(type)
+          return type if type.is_a?(Integer)
+          type.const_get(:TypeValue)
+        end
+
+        def self.encode_type_bitmap(types)
+          bitmap = ''.b
+          groups = types.group_by {|type| type >> 8}
+          groups.keys.sort.each do |window|
+            values = groups[window]
+            max = values.max & 255
+            bits = "\0".b * ((max / 8) + 1)
+            values.each {|type| bits[(255 & type) / 8] = (bits[(255 & type) / 8].ord | (0x80 >> ((255 & type) % 8))).chr}
+            bitmap << [window, bits.bytesize].pack('CC') << bits
+          end
+          bitmap
+        end
+
+        def self.decode_type_bitmap(data)
+          types = []
+          offset = 0
+          while offset < data.bytesize
+          raise Resolv::DNS::DecodeError.new('truncated NSEC bitmap window') if offset + 2 > data.bytesize
+            window, length = data.unpack("@#{offset}CC")
+            offset += 2
+          raise Resolv::DNS::DecodeError.new('truncated NSEC bitmap') if length.zero? || offset + length > data.bytesize
+            bits = data.byteslice(offset, length)
+            length.times do |byte_index|
+              8.times do |bit|
+                types << (window * 256 + byte_index * 8 + bit) if (bits.getbyte(byte_index) & (0x80 >> bit)) != 0
+              end
+            end
+            offset += length
+          end
+          raise Resolv::DNS::DecodeError.new('NSEC bitmap windows are not sorted') unless types == types.sort
+          raise Resolv::DNS::DecodeError.new('NSEC bitmap contains a duplicate type') unless types.length == types.uniq.length
+          types
+        end
+
+        def self.canonical_name(name)
+          Resolv::DNS::Message::MessageEncoder.new(canonical: true) {|msg| msg.put_name(Name.create(name))}.to_s
+        end
+
+        def self.canonical_rr(name, klass, ttl, data)
+          Resolv::DNS::Message::MessageEncoder.new(canonical: true) do |msg|
+            msg.put_name(name)
+            msg.put_pack('nnN', klass::TypeValue, klass::ClassValue, ttl)
+            msg.put_length16 {data.encode_rdata(msg)}
+          end.to_s
+        end
+
+        def self.wildcard_name(name)
+          labels = Name.create(name).to_a.dup
+          return nil if labels.empty?
+          labels.unshift(Label::Str.new('*'))
+          Name.new(labels, true)
+        end
+
+        def self.append_label(name, label)
+          labels = Name.create(name).to_a.dup
+          labels.unshift(Label::Str.new(label))
+          Name.new(labels, true)
+        end
+
+        def self.name_equal?(left, right)
+          Name.create(left) == Name.create(right)
+        end
+
+        def self.subdomain?(name, parent)
+          name = Name.create(name)
+          parent = Name.create(parent)
+          name == parent || name.subdomain_of?(parent)
+        end
+
+        def self.wildcard_match_name?(name, wildcard)
+          name = Name.create(name).to_a
+          wildcard = Name.create(wildcard).to_a
+          return false if name.length < wildcard.length
+          return false unless wildcard.first.to_s == '*'
+          name.last(wildcard.length - 1).map(&:to_s) == wildcard.last(wildcard.length - 1).map(&:to_s)
+        end
+
+        def self.compare_names(left, right)
+          left = Name.create(left).to_a
+          right = Name.create(right).to_a
+          left.zip(right).reverse_each do |label, other|
+            return 1 if other.nil?
+            a = label.downcase.b
+            b = other.downcase.b
+            if a.length != b.length
+              a.length < b.length ? (return -1) : (return 1)
+            end
+            next if a == b
+            a.bytes.zip(b.bytes) do |ac, bc|
+              next if ac == bc
+              ac < bc ? (return -1) : (return 1)
+            end
+          end
+          left.length <=> right.length
+        end
+
+        def self.cover_name?(owner, next_name, target)
+          owner_name = Name.create(owner)
+          next_name = Name.create(next_name)
+          target_name = Name.create(target)
+          if owner_name == next_name
+            false
+          elsif compare_names(owner_name, next_name) < 0
+            compare_names(owner_name, target_name) < 0 &&
+              compare_names(target_name, next_name) < 0
+          else
+            compare_names(owner_name, target_name) < 0 ||
+              compare_names(target_name, next_name) < 0
+          end
+        end
+
+        BASE32HEX_ALPHABET = '0123456789abcdefghijklmnopqrstuv'.freeze
+
+        def self.base32hex_decode(value)
+          value = value.b.downcase
+          bits = 0
+          count = 0
+          output = ''.b
+          value.each_byte do |byte|
+          digit = byte - '0'.ord
+          digit -= ('a'.ord - '9'.ord - 1) if byte >= 'a'.ord
+          raise Resolv::DNS::DecodeError.new('invalid NSEC3 hash label') unless digit >= 0 && digit < 32
+            bits = (bits << 5) | digit
+            count += 5
+            if count >= 8
+              count -= 8
+              output << ((bits >> count) & 255).chr
+            end
+          end
+          raise Resolv::DNS::DecodeError.new('invalid NSEC3 hash padding') unless count.zero?
+          output
+        end
+
+        def self.base32hex_encode(value)
+          output = ''.b
+          bits = 0
+          count = 0
+          value.each_byte do |byte|
+            bits = ((bits << 8) | byte) & 0xffffffff
+            count += 8
+            while count >= 5
+              count -= 5
+              output << BASE32HEX_ALPHABET[(bits >> count) & 31]
+            end
+          end
+          if count > 0
+            output << BASE32HEX_ALPHABET[(bits << (5 - count)) & 31]
+          end
+          output
+        end
+
+        def self.nsec3_hash(name, algorithm, iterations, salt)
+          require 'openssl'
+          raise VerificationError.new('unsupported NSEC3 hash algorithm') unless algorithm == 1
+          digest = canonical_name(name)[0..-2]
+          (iterations + 1).times do
+            digest = OpenSSL::Digest.digest('SHA1', digest + salt.b)
+          end
+          digest
+        end
+
+        def self.nsec3_owner(name, zone, algorithm, iterations, salt)
+          hashed = nsec3_hash(name, algorithm, iterations, salt)
+          labels = Name.create(zone).to_a.dup
+          labels.unshift(Label::Str.new(base32hex_encode(hashed).upcase))
+          Name.new(labels, true)
+        end
+
+        def self.hashed_owner(owner, zone)
+          labels = Name.create(owner).to_a
+          zone_labels = Name.create(zone).to_a
+          unless labels.length == zone_labels.length + 1 && labels[-zone_labels.length, zone_labels.length] == zone_labels
+            raise Resolv::DNS::DecodeError.new('NSEC3 owner is outside its zone')
+          end
+          base32hex_decode(labels[0].to_s)
+        end
+
+        def self.cover_hash?(record_hash, next_hash, target_hash)
+          if record_hash == next_hash
+            false
+          elsif record_hash < next_hash
+            record_hash < target_hash && target_hash < next_hash
+          else
+            record_hash < target_hash || target_hash > next_hash
+          end
+        end
+
+        def self.key_tag(dnskey)
+          wire = [dnskey.flags, dnskey.protocol, dnskey.algorithm].pack('nCC') + dnskey.public_key.b
+          sum = 0
+          wire.each_byte.each_with_index do |byte, index|
+            sum += index.even? ? byte * 256 : byte
+          end
+          ((sum + (sum >> 16)) & 0xffff)
+        end
+
+        def self.verify_negative_response(message, qname, qtype, trusted_keys, time = Time.now)
+          require 'openssl'
+          message = Resolv::DNS::Message.decode(message) if message.is_a?(String)
+          Validator.new(message, qname, qtype, trusted_keys, time).verify
+        end
+
+        class Validator
+          def initialize(message, qname, qtype, trusted_keys, time)
+            @message = message
+            created = Name.create(qname)
+            @qname = Name.new(created.to_a, true)
+            @qtype = DNSSEC.type_value(qtype)
+            @time = time.respond_to?(:to_i) ? time : Time.at(time)
+            @trusted_keys = normalize_keys(trusted_keys)
+            @authority = section_records(@message.authority, :authority)
+            @answer = section_records(@message.answer, :answer)
+            @failures = []
+            @evidence = []
+            @signature_result = nil
+          end
+
+          def verify
+            unless valid_question? && (@message.rcode == 0 || @message.rcode == 3)
+              return negative_result(:unproven, false, 'response question or rcode does not match the query')
+            end
+
+            soa_zones = authority_owners(Resource::IN::SOA).map {|entry| entry[:name]}.uniq
+            signer_zones = rrsigs.map {|entry| entry[:data].signer}.uniq
+            soa_zones.select! {|zone| DNSSEC.subdomain?(@qname, zone)}
+            signer_zones.select! {|zone| DNSSEC.subdomain?(@qname, zone)}
+
+            if @message.rcode == 3
+              zone, result = soa_zones.map {|candidate| [candidate, prove_nxdomain(candidate)]}.find {|_, value| value}
+              return finish(result || negative_result(:unproven, false, 'no NSEC or NSEC3 range proves NXDOMAIN', soa_zones.first), zone)
+            end
+
+            positive = wildcard_match?
+            if positive
+              wildcard_signer_zones = rrsigs(@answer).map {|entry| entry[:data].signer}.uniq
+              wildcard_signer_zones.select! {|candidate| DNSSEC.subdomain?(@qname, candidate)}
+              zone, result = wildcard_signer_zones.map {|candidate| [candidate, prove_wildcard_match(candidate)]}.find {|_, value| value}
+              result ||= negative_result(:wildcard_match, false, 'no authenticated denial proves a wildcard expansion')
+            else
+              zone, result = soa_zones.map {|candidate| [candidate, prove_nodata(candidate)]}.find {|_, value| value}
+              result ||= negative_result(:nodata, false, 'no NSEC or NSEC3 range plus type bitmap proves NODATA')
+            end
+            finish(result, zone)
+          end
+
+          private
+
+          def section_records(section, section_name)
+            section.map {|name, ttl, data| {name: name, ttl: ttl, data: data, type: data.class::TypeValue, klass: data.class::ClassValue, section: section_name}}
+          end
+
+          def rrsigs(records = nil)
+            records = @authority + @answer if records.nil?
+            records.select {|entry| entry[:type] == Resource::IN::RRSIG::TypeValue}
+          end
+
+          def authority_owners(klass)
+            type = klass::TypeValue
+            @authority.select {|entry| entry[:type] == type}
+          end
+
+          def normalize_keys(keys)
+            normalized = Hash.new {|hash, name| hash[name] = []}
+            entries = keys.is_a?(Hash) ? [keys] : Array(keys)
+            entries.each do |entry|
+              if entry.is_a?(Hash)
+                key = entry.values.first
+                signer = entry.keys.first
+              elsif entry.is_a?(Resource::DNSKEY)
+                key = entry
+                signer = nil
+              else
+                key = entry
+                signer = nil
+              end
+              if key.is_a?(String) && key.bytesize >= 4
+                flags, protocol, algorithm = key.unpack('nCC')
+                key = Resource::IN::DNSKEY.new(flags, protocol, algorithm, key.byteslice(4..-1))
+              end
+              next unless key.is_a?(Resource::DNSKEY)
+              if signer
+                created_signer = Name.create(signer)
+                signer_name = Name.new(created_signer.to_a, true)
+                normalized[signer_name] << key
+              else
+                normalized[nil] << key
+              end
+            end
+            normalized
+          end
+
+          def valid_question?
+            return false unless @message.qr == 1
+            return false if @message.tc == 1
+            return false unless @message.question.length == 1
+            name, typeclass = @message.question.first
+            name.to_a == @qname.to_a && typeclass::TypeValue == @qtype && typeclass::ClassValue == Resource::IN::ClassValue
+          rescue StandardError
+            false
+          end
+
+          def negative_result(status, proven, reason_text, zone = nil)
+            NegativeResult.new(status, proven, reason_text, zone, false, @evidence.uniq, signatures)
+          end
+
+          def finish(result, zone)
+            result.zone = zone if result.zone.nil? && zone
+            result.records = result.records.map {|record| record.is_a?(Hash) ? record : record.first}.uniq
+            result.signatures = signatures
+            result.proven = result.status != :insecure_delegation &&
+                            signatures.valid && result.reason.nil?
+            result
+          end
+
+          def signatures
+            return @signature_result if @signature_result
+            checked = []
+            required = required_signed_records
+            required.each do |record|
+              valid = verify_record(record)
+              checked << record unless valid
+            end
+            @signature_result = SignatureResult.new(checked.empty?, required.length, checked.map {|record| signature_failure(record)})
+          end
+
+          def required_signed_records
+            records = []
+            [[:answer, @answer], [:authority, @authority]].each do |section_name, section|
+              section.each do |record|
+                type = record[:type]
+                next if type == Resource::IN::RRSIG::TypeValue
+                relevant = section_name == :answer ? positive_record?(record) : relevant_authority?(record)
+                records << record.merge(section: section_name) if relevant
+              end
+            end
+            records
+          end
+
+          def relevant_authority?(record)
+            case record[:type]
+            when Resource::IN::SOA::TypeValue, Resource::IN::NSEC::TypeValue,
+                 Resource::IN::NSEC3::TypeValue, Resource::IN::NSEC3PARAM::TypeValue
+              true
+            else
+              false
+            end
+          end
+
+          def positive_record?(record)
+            chain_name = follow_cname
+            return true if record[:name] == @qname && record[:type] == @qtype
+            record[:name] == chain_name && record[:type] == @qtype
+          end
+
+          def wildcard_match?
+            wildcard_answer.any?
+          end
+
+          def wildcard_answer
+            @answer.select do |record|
+              next false unless record[:type] == @qtype
+              !wildcard_signatures(record).empty?
+            end
+          end
+
+          def answer_wildcard_name
+            wildcard_answer.map do |record|
+              signature = wildcard_signatures(record).find do |candidate|
+                (candidate[:name] == record[:name] || wildcard_signed?(candidate, record)) &&
+                  candidate[:data].labels < record[:name].length &&
+                  candidate[:name].to_a.first.to_s == '*'
+              end
+              next nil unless signature
+              labels = [Label::Str.new('*')] + record[:name].to_a.last(signature[:data].labels)
+              Name.new(labels, true)
+            end.compact.first
+          end
+
+          def wildcard_signatures(record)
+            rrsigs(@answer).select do |signature|
+              sig = signature[:data]
+              sig.type_covered == record[:type] && sig.labels < record[:name].length &&
+                record[:name].to_a.last(sig.labels) == signature[:name].to_a.last(sig.labels) &&
+                signature[:name].to_a.length == sig.labels + 1 &&
+                signature[:name].to_a.first.to_s == '*'
+            end
+          end
+
+          def follow_cname
+            current = @qname
+            @answer.each do |record|
+              if record[:name] == current && record[:type] == Resource::IN::CNAME::TypeValue
+                current = record[:data].name
+              end
+            end
+            current
+          end
+
+          def nsec_records(zone)
+            @authority.select do |entry|
+              entry[:type] == Resource::IN::NSEC::TypeValue &&
+                DNSSEC.subdomain?(entry[:name], zone) &&
+                DNSSEC.subdomain?(entry[:data].next_domain, zone) &&
+                entry[:data].types.include?(Resource::IN::NSEC::TypeValue)
+            end
+          end
+
+          def nsec3_records(zone, parameters = nil)
+            @authority.select do |entry|
+              next false unless entry[:type] == Resource::IN::NSEC3::TypeValue
+              data = entry[:data]
+              next false unless data.hash_algorithm == 1
+              next false unless (data.flags & ~1).zero?
+              next false unless DNSSEC.subdomain?(entry[:name], zone)
+              next false unless data.types.include?(Resource::IN::NSEC3::TypeValue)
+              next false unless parameters.nil? || nsec3_parameters(data) == parameters
+              true
+            end
+          rescue Resolv::DNS::DecodeError
+            []
+          end
+
+          def nsec3_parameters(data)
+            [data.hash_algorithm, data.flags & ~1, data.iterations, data.salt.b]
+          end
+
+          def nsec3_hashes(records, zone)
+            records.map do |entry|
+              owner_hash = DNSSEC.hashed_owner(entry[:name], zone)
+              next_hash = entry[:data].next_hashed_owner.b
+              raise Resolv::DNS::DecodeError.new('bad NSEC3 hash length') unless owner_hash.bytesize == 20 && next_hash.bytesize == 20
+              [entry, owner_hash, next_hash]
+            end
+          rescue Resolv::DNS::DecodeError
+            []
+          end
+
+          def prove_nxdomain(zone)
+            prove_nsec_nxdomain(zone) || prove_nsec3_nxdomain(zone)
+          end
+
+          def prove_nodata(zone)
+            prove_nsec_nodata(zone) || prove_nsec3_nodata(zone)
+          end
+
+          def prove_wildcard_match(zone)
+            prove_nsec_wildcard_match(zone) || prove_nsec3_wildcard_match(zone)
+          end
+
+          def parent_suffixes(name, zone)
+            labels = Name.create(name).to_a
+            zone_length = Name.create(zone).length
+            return [] if labels.length < zone_length
+            (0..(labels.length - zone_length)).map do |count|
+              Name.new(labels[count..-1], true)
+            end
+          end
+
+          def nsec_closest_encloser(name, zone, records)
+            suffixes = parent_suffixes(name, zone)
+            suffixes.find do |candidate|
+              records.any? {|entry| entry[:name] == candidate} ||
+                (candidate == zone && authority_owners(Resource::IN::SOA).any? {|soa| soa[:name] == zone})
+            end
+          end
+
+          def nsec_cover(target, zone, records)
+            records.find do |entry|
+              DNSSEC.cover_name?(entry[:name], entry[:data].next_domain, target)
+            end
+          end
+
+          def prove_nsec_nxdomain(zone)
+            records = nsec_records(zone)
+            encloser = nsec_closest_encloser(@qname, zone, records)
+            return nil unless encloser
+            wildcard = DNSSEC.wildcard_name(encloser)
+            qname_cover = nsec_cover(@qname, zone, records)
+            wildcard_cover = nsec_cover(wildcard, zone, records)
+            return nil unless qname_cover && wildcard_cover
+            @evidence = [qname_cover, wildcard_cover]
+            NegativeResult.new(:nxdomain, nil, nil, zone, false, @evidence, nil)
+          end
+
+          def exact_nsec_nodata(records)
+            target = follow_cname
+            record = records.find {|entry| entry[:name] == target}
+            return nil unless record
+            return nil if record[:data].types.include?(@qtype)
+            @evidence = [record]
+            NegativeResult.new(:nodata, nil, nil, nil, false, @evidence, nil)
+          end
+
+          def wildcard_nsec_nodata(records, zone)
+            encloser = nsec_closest_encloser(@qname, zone, records)
+            return nil unless encloser
+            wildcard = DNSSEC.wildcard_name(encloser)
+            wildcard_record = records.find {|entry| entry[:name] == wildcard}
+            return nil unless wildcard_record
+            return nil if wildcard_record[:data].types.include?(@qtype)
+            @evidence = [wildcard_record]
+            NegativeResult.new(:nodata, nil, nil, zone, true, @evidence, nil)
+          end
+
+          def prove_nsec_nodata(zone)
+            records = nsec_records(zone)
+            exact_nsec_nodata(records) || wildcard_nsec_nodata(records, zone)
+          end
+
+          def prove_nsec_wildcard_match(zone)
+            wildcard = answer_wildcard_name
+            return nil unless wildcard && DNSSEC.wildcard_match_name?(@qname, wildcard)
+            @evidence = wildcard_answer
+            NegativeResult.new(:wildcard_match, nil, nil, zone, true, @evidence, nil)
+          end
+
+          def nsec3_groups(zone)
+            records = nsec3_records(zone)
+            groups = records.group_by do |entry|
+              data = entry[:data]
+            [data.hash_algorithm, data.flags & ~1, data.iterations, data.salt.b]
+            end
+            groups.each_value do |entries|
+              yield(entries, nsec3_parameters(entries.first[:data]))
+            end
+          end
+
+          def nsec3_exact_owner?(target, zone, hashed_records, parameters)
+            target_hash = DNSSEC.nsec3_hash(target, parameters[0], parameters[2], parameters[3])
+            hashed_records.any? {|_, owner_hash, _| owner_hash == target_hash}
+          end
+
+          def nsec3_cover(target, zone, hashed_records, parameters, allow_opt_out: false)
+            target_hash = DNSSEC.nsec3_hash(target, parameters[0], parameters[2], parameters[3])
+            hashed_records.find do |entry, owner_hash, next_hash|
+              next_hash.bytesize == target_hash.bytesize &&
+                DNSSEC.cover_hash?(owner_hash, next_hash, target_hash) &&
+                (allow_opt_out || !entry[:data].opt_out?)
+            end
+          end
+
+          def nsec3_encloser(zone, hashed_records, parameters)
+            parent_suffixes(@qname, zone).find do |candidate|
+              if candidate == zone
+                authority_owners(Resource::IN::SOA).any? {|soa| soa[:name] == zone}
+              else
+                nsec3_exact_owner?(candidate, zone, hashed_records, parameters)
+              end
+            end
+          end
+
+          def matching_nsec3param?(zone, parameters)
+            params = @authority.select {|entry| entry[:type] == Resource::IN::NSEC3PARAM::TypeValue && entry[:name] == zone}
+            return true if params.empty?
+            params.any? do |entry|
+              data = entry[:data]
+              data.flags == 0 &&
+                [data.hash_algorithm, data.flags, data.iterations, data.salt.b] ==
+                  [parameters[0], 0, parameters[2], parameters[3]]
+            end
+          end
+
+          def prove_nsec3_nxdomain(zone)
+            each_nsec3_group(zone) do |records, parameters|
+              hashed = nsec3_hashes(records, zone)
+              next if hashed.empty? || !matching_nsec3param?(zone, parameters)
+              encloser = nsec3_encloser(zone, hashed, parameters)
+              next unless encloser
+              return nil if nsec3_exact_owner?(@qname, zone, hashed, parameters)
+              next_closer = DNSSEC.append_label(encloser, @qname.to_a[@qname.length - encloser.length - 1].to_s)
+              wildcard = DNSSEC.wildcard_name(encloser)
+              nc_cover = nsec3_cover(next_closer, zone, hashed, parameters)
+              wildcard_cover = nsec3_cover(wildcard, zone, hashed, parameters)
+              next unless nc_cover && wildcard_cover
+              @evidence = [nc_cover, wildcard_cover]
+              return NegativeResult.new(:nxdomain, nil, nil, zone, false, @evidence, nil)
+            end
+            nil
+          end
+
+          def prove_nsec3_nodata(zone)
+            each_nsec3_group(zone) do |records, parameters|
+              hashed = nsec3_hashes(records, zone)
+              next if hashed.empty? || !matching_nsec3param?(zone, parameters)
+              exact_hash = DNSSEC.nsec3_hash(follow_cname, parameters[0], parameters[2], parameters[3])
+              exact = hashed.find {|_, owner_hash, _| owner_hash == exact_hash}
+              if exact
+                if exact.first[:data].types.include?(@qtype)
+                  next
+                elsif exact.first[:data].opt_out? && @qtype == Resource::IN::DS::TypeValue
+                  @evidence = [exact.first]
+                  return NegativeResult.new(:insecure_delegation, nil, nil, zone, false, @evidence, nil)
+                end
+                @evidence = [exact.first]
+                return NegativeResult.new(:nodata, nil, nil, zone, false, @evidence, nil)
+              end
+
+              encloser = nsec3_encloser(zone, hashed, parameters)
+              next unless encloser
+              next_closer = DNSSEC.append_label(encloser, @qname.to_a[@qname.length - encloser.length - 1].to_s)
+              wildcard = DNSSEC.wildcard_name(encloser)
+              wildcard_hash = DNSSEC.nsec3_hash(wildcard, parameters[0], parameters[2], parameters[3])
+              wildcard_record = hashed.find {|_, owner_hash, _| owner_hash == wildcard_hash}
+              if wildcard_record
+                next if wildcard_record.first[:data].types.include?(@qtype)
+                @evidence = [wildcard_record.first]
+                return NegativeResult.new(:nodata, nil, nil, zone, true, @evidence, nil)
+              end
+
+              cover = nsec3_cover(next_closer, zone, hashed, parameters, allow_opt_out: @qtype == Resource::IN::DS::TypeValue)
+              if cover && cover.first[:data].opt_out? && @qtype == Resource::IN::DS::TypeValue
+                @evidence = [cover.first]
+                return NegativeResult.new(:insecure_delegation, nil, nil, zone, false, @evidence, nil)
+              end
+            end
+            nil
+          end
+
+          def prove_nsec3_wildcard_match(zone)
+            wildcard = answer_wildcard_name
+            return nil unless wildcard && DNSSEC.wildcard_match_name?(@qname, wildcard)
+            @evidence = wildcard_answer
+            NegativeResult.new(:wildcard_match, nil, nil, zone, true, @evidence, nil)
+          end
+
+          def each_nsec3_group(zone)
+            seen = {}
+            nsec3_groups(zone) do |records, parameters|
+              next if seen[parameters]
+              seen[parameters] = true
+              valid = nsec3_records(zone, parameters)
+              yield(valid, parameters)
+            end
+          end
+
+          def verify_record(record)
+            candidates = rrsigs(records_for_section(record[:section])).select do |signature|
+              sig = signature[:data]
+              signature[:name] == record[:name] ||
+                (sig.type_covered == record[:type] &&
+                 sig.labels < record[:name].length &&
+                 record[:name].to_a.last(sig.labels) == signature[:name].to_a.last(sig.labels))
+            end
+            failures = []
+            valid = candidates.any? do |signature|
+              failure = verify_rrsig(signature, record)
+              failures << failure unless failure.nil?
+              failure.nil?
+            end
+            @failure = valid ? nil : (failures.last || 'missing RRSIG')
+            valid
+          end
+
+          def records_for_section(section)
+            section == :answer ? @answer : @authority
+          end
+
+          def signature_failure(record)
+            {name: record[:name].to_s, type: record[:type], reason: @failure || 'missing RRSIG'}
+          end
+
+          def wildcard_signed?(signature, record)
+            sig = signature[:data]
+            sig.type_covered == record[:type] &&
+              sig.labels < record[:name].length &&
+              record[:name].to_a.last(sig.labels) == signature[:name].to_a.last(sig.labels) &&
+              signature[:name].to_a.length == sig.labels + 1 &&
+              signature[:name].to_a.first.to_s == '*'
+          end
+
+          def verify_rrsig(signature_entry, record)
+            sig = signature_entry[:data]
+            keys = @trusted_keys[nil] + @trusted_keys[sig.signer]
+            key = keys.find do |candidate|
+              candidate.algorithm == sig.algorithm &&
+                DNSSEC.key_tag(candidate) == sig.key_tag
+            end
+            unless key
+              return 'no trusted key matches RRSIG'
+            end
+            unless sig.type_covered == record[:type] && DNSSEC.subdomain?(record[:name], sig.signer)
+              return 'RRSIG owner or covered type does not match'
+            end
+            unless (sig.inception..sig.expiration).include?(@time.to_i)
+              return 'RRSIG is outside its validity period'
+            end
+            unless key.protocol == 3 && valid_dnskey_flags?(key)
+              return 'DNSKEY protocol or flags are invalid'
+            end
+            wildcard_labels = sig.labels < record[:name].length &&
+                             record[:name].to_a.first.to_s != '*' &&
+                             signature_entry[:name].to_a.first.to_s == '*' &&
+                             signature_entry[:name].length == sig.labels + 1 &&
+                             record[:name].to_a.last(sig.labels) == signature_entry[:name].to_a.last(sig.labels)
+            valid_labels = sig.labels == record[:name].length || wildcard_labels
+            unless valid_labels && record[:ttl] <= sig.original_ttl
+              return 'RRSIG label count or original TTL is invalid'
+            end
+            unless verify_crypto(key, sig, signature_entry, record)
+              return 'RRSIG cryptographic verification failed'
+            end
+            nil
+          rescue StandardError => error
+            error.message
+          end
+
+          def verify_crypto(key, sig, signature_entry, record)
+            info = DNSSEC::Algorithm[sig.algorithm]
+            return false unless info
+            sorted_rrset = rrset(record, signature_entry).sort
+            data = rrsig_prefix(sig) + sorted_rrset.join
+            public_key = build_public_key(key)
+            if info[0].to_s.start_with?('ecdsa')
+              signature = ecdsa_der(sig.signature, info[2])
+            else
+              signature = sig.signature
+            end
+            public_key.verify(info[1], signature, data)
+          rescue OpenSSL::PKey::PKeyError
+            false
+          end
+
+          def valid_dnskey_flags?(key)
+            (key.flags & 0x0100 == 0x0100) || (key.flags & 0x0101).zero?
+          end
+
+          def rrset(record, signature_entry)
+            records_for_section(record[:section]).select do |entry|
+              entry[:name] == record[:name] &&
+                entry[:type] == record[:type] &&
+                entry[:klass] == record[:klass]
+            end.map do |entry|
+              ttl = signature_entry ? signature_entry[:data].original_ttl : canonical_ttl(entry)
+              DNSSEC.canonical_rr(entry[:name], entry[:data].class, ttl, entry[:data])
+            end
+          end
+
+          def canonical_ttl(entry)
+            matching = rrsigs(records_for_section(entry[:section])).select do |signature|
+              signature[:name] == entry[:name] && signature[:data].type_covered == entry[:type]
+            end.map {|signature| signature[:data].original_ttl}
+            matching.push(entry[:ttl]).min
+          end
+
+          def rrsig_prefix(sig)
+            [sig.type_covered, sig.algorithm, sig.labels, sig.original_ttl,
+             sig.expiration, sig.inception, sig.key_tag].pack('nCCNNNn') +
+              DNSSEC.canonical_name(sig.signer)
+          end
+
+          def ecdsa_der(signature, length)
+            raise OpenSSL::PKey::PKeyError.new('bad ECDSA signature length') unless signature.bytesize == length
+            half = length / 2
+            asn1_integer(signature.byteslice(0, half)) + asn1_integer(signature.byteslice(half, half))
+          end
+
+          def asn1_integer(value)
+            value = "\x00#{value}" if value.empty? || value.getbyte(0) >= 128
+            "\x02#{der_length(value.bytesize)}#{value}".b
+          end
+
+          def der_length(length)
+            if length < 128
+              length.chr
+            elsif length < 256
+              [0x81, length].pack('CC')
+            else
+              [0x82, length].pack('Cn')
+            end
+          end
+
+          def build_public_key(dnskey)
+            case dnskey.algorithm
+            when 5, 7, 8, 10
+              build_rsa_key(dnskey.public_key)
+            when 13
+              build_ec_key('\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07'.b, dnskey.public_key, 64)
+            when 14
+              build_ec_key('\x06\x05\x2b\x81\x04\x00\x22'.b, dnskey.public_key, 96)
+            when 15
+              build_ed_key('\x06\x03\x2b\x65\x70'.b, dnskey.public_key, 32)
+            when 16
+              build_ed_key('\x06\x03\x2b\x65\x71'.b, dnskey.public_key, 57)
+            else
+              raise VerificationError.new('unsupported DNSKEY algorithm')
+            end
+          end
+
+          def der_sequence(value)
+            "\x30#{der_length(value.bytesize)}#{value}".b
+          end
+
+          def der_bit_string(value)
+            "\x03#{der_length(value.bytesize + 1)}\x00#{value}".b
+          end
+
+          def build_ed_key(oid, point, expected_length)
+            raise VerificationError.new('bad EdDSA key length') unless point.bytesize == expected_length
+            OpenSSL::PKey.read(der_sequence(der_sequence(oid) + der_bit_string(point)))
+          end
+
+          def build_ec_key(oid, point, expected_length)
+            raise VerificationError.new('bad ECDSA key length') unless point.bytesize == expected_length + 1
+            raise VerificationError.new('bad ECDSA public point') unless point.getbyte(0) == 4
+            OpenSSL::PKey.read(der_sequence(der_sequence(oid) + der_bit_string(point.byteslice(1..-1))))
+          end
+
+          def build_rsa_key(blob)
+            raise VerificationError.new('short RSA DNSKEY') if blob.bytesize < 2
+            offset = 0
+            exponent_length = blob.getbyte(0)
+            if exponent_length != 0
+              exponent = blob.byteslice(1, exponent_length)
+              offset = 1 + exponent_length
+            else
+              exponent_length = blob.unpack('@1n')[0]
+              exponent = blob.byteslice(3, exponent_length)
+              offset = 3 + exponent_length
+            end
+            modulus = blob.byteslice(offset..-1)
+            raise VerificationError.new('short RSA DNSKEY exponent or modulus') if exponent.empty? || modulus.empty?
+            rsa_public_key = der_sequence(asn1_integer(modulus) + asn1_integer(exponent))
+            rsa_algorithm = der_sequence("\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01\x05\x00".b)
+            OpenSSL::PKey.read(der_sequence(rsa_algorithm + der_bit_string(rsa_public_key)))
+          end
+        end
+      end
     end
+    DNSSEC = Resource::DNSSEC
   end
 
   ##

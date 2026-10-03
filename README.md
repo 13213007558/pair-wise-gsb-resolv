@@ -38,6 +38,24 @@ Resolv::DNS.open do |dns|
 end
 ```
 
+### Offline DNSSEC denial-of-existence validation
+
+Pass a complete response, the question name/type, and an already trusted
+DNSKEY to verify NSEC/NSEC3 denial proofs without making network requests.
+
+```ruby
+result = Resolv::DNS::DNSSEC.verify_negative_response(
+  wire_response,
+  "example.org",
+  Resolv::DNS::Resource::IN::MX,
+  { Resolv::DNS::Name.create("example.org.") => trusted_dnskey }
+)
+
+result.status       # :nxdomain, :nodata, :wildcard_match, :insecure_delegation, or :unproven
+result.proven?      # denial interval/type bitmap and RRSIGs are both valid
+result.signatures   # separate signature verification details
+```
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake test` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.
