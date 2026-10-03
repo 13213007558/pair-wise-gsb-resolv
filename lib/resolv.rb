@@ -5,6 +5,7 @@ require 'timeout'
 require 'io/wait' if RUBY_VERSION < '3.2'
 require 'securerandom'
 require 'rbconfig'
+require 'openssl'
 
 # Resolv is a thread-aware DNS resolver library written in Ruby.  Resolv can
 # handle multiple DNS requests concurrently without blocking the entire Ruby
@@ -1630,13 +1631,15 @@ class Resolv
           [@answer, @authority, @additional].each {|rr|
             rr.each {|r|
               name, ttl, data = r
-              msg.put_name(name)
+              msg.put_name(name, compress: !(Resource::TSIG === data))
               msg.put_pack('nnN', data.class::TypeValue, data.class::ClassValue, ttl)
               msg.put_length16 {data.encode_rdata(msg)}
             }
           }
         }.to_s
       end
+
+      attr_accessor :raw # :nodoc:
 
       class MessageEncoder # :nodoc:
         def initialize
@@ -1721,6 +1724,7 @@ class Resolv
 
       def Message.decode(m)
         o = Message.new(0)
+        o.raw = m.b
         MessageDecoder.new(m) {|msg|
           id, flag, qdcount, ancount, nscount, arcount =
             msg.get_unpack('nnnnnn')
@@ -1761,6 +1765,8 @@ class Resolv
           @limit = data.bytesize
           yield self
         end
+
+        attr_reader :index # :nodoc:
 
         def inspect
           "\#<#{self.class}: #{@data.byteslice(0, @index).inspect} #{@data.byteslice(@index..-1).inspect}>"
@@ -2446,6 +2452,13 @@ class Resolv
       end
 
       ##
+      # Full Zone Transfer query type.
+
+      class AXFR < Query
+        TypeValue = 252 # :nodoc:
+      end
+
+      ##
       # Start Of Authority resource.
 
       class SOA < Resource
@@ -2766,6 +2779,46 @@ class Resolv
       end
 
       ##
+      # TSIG resource record defined in RFC 8945.
+
+      class TSIG < Resource
+        TypeValue = 250 # :nodoc:
+        ClassValue = 255 # :nodoc:
+        ClassHash[[TypeValue, ClassValue]] = self # :nodoc:
+
+        def initialize(algorithm, time_signed, fudge, mac, original_id, error = 0, other_data = ''.b)
+          @algorithm = Name.create(algorithm)
+          @time_signed = time_signed
+          @fudge = fudge
+          @mac = mac.b
+          @original_id = original_id
+          @error = error
+          @other_data = other_data.b
+        end
+
+        attr_reader :algorithm, :time_signed, :fudge, :mac, :original_id, :error, :other_data
+
+        def encode_rdata(msg) # :nodoc:
+          msg.put_name(@algorithm, compress: false)
+          msg.put_pack('nNn', @time_signed >> 32, @time_signed & 0xffffffff, @fudge)
+          msg.put_pack('n', @mac.bytesize)
+          msg.put_bytes(@mac)
+          msg.put_pack('nnn', @original_id, @error, @other_data.bytesize)
+          msg.put_bytes(@other_data)
+        end
+
+        def self.decode_rdata(msg) # :nodoc:
+          algorithm = msg.get_name
+          time_hi, time_lo, fudge = msg.get_unpack('nNn')
+          mac_size, = msg.get_unpack('n')
+          mac = msg.get_bytes(mac_size)
+          original_id, error, other_size = msg.get_unpack('nnn')
+          other_data = msg.get_bytes(other_size)
+          return self.new(algorithm, (time_hi << 32) | time_lo, fudge, mac, original_id, error, other_data)
+        end
+      end
+
+      ##
       # CAA resource record defined in RFC 8659
       #
       # These records identify certificate authority allowed to issue
@@ -2828,7 +2881,7 @@ class Resolv
       end
 
       ClassInsensitiveTypes = [ # :nodoc:
-        NS, CNAME, SOA, PTR, HINFO, MINFO, MX, TXT, LOC, ANY, CAA
+        NS, CNAME, SOA, PTR, HINFO, MINFO, MX, TXT, LOC, AXFR, ANY, CAA
       ]
 
       ##
@@ -3103,6 +3156,583 @@ class Resolv
           ClassValue = IN::ClassValue
           ClassHash[[TypeValue, ClassValue]] = self # :nodoc:
         end
+      end
+    end
+
+    ##
+    # Transaction Signature (TSIG) authentication for DNS messages.
+
+    module TSIG
+      HMAC_SHA256 = 'hmac-sha256.'.freeze
+      MAC_SIZE = 32
+      DEFAULT_FUDGE = 300
+
+      class Error < ResolvError
+      end
+
+      class MalformedMessage < Error
+      end
+
+      class BadKey < Error
+      end
+
+      class BadAlgorithm < Error
+      end
+
+      class BadTime < Error
+      end
+
+      class BadSignature < Error
+        def initialize(message = 'TSIG signature verification failed')
+          super
+        end
+      end
+
+      class BadTruncation < BadSignature
+        def initialize(message = 'TSIG MAC has a non-canonical length')
+          super
+        end
+      end
+
+      class PeerError < Error
+        attr_reader :tsig_error
+
+        def initialize(tsig_error)
+          @tsig_error = tsig_error
+          super("TSIG peer error #{tsig_error}")
+        end
+      end
+
+      class ContextError < Error
+      end
+
+      module Helpers # :nodoc: all
+        Message = DNS::Message
+        MessageEncoder = DNS::Message::MessageEncoder
+        MessageDecoder = DNS::Message::MessageDecoder
+        Resource = DNS::Resource
+        RCode = DNS::RCode
+        private_constant :Message, :MessageEncoder, :MessageDecoder, :Resource, :RCode
+
+        def check_fudge(value)
+          value = value.to_int
+          unless value >= 0 && value <= 0xffff
+            raise ArgumentError, 'TSIG fudge must be between 0 and 65535'
+          end
+          value
+        end
+
+        def check_uint16(value, name)
+          value = value.to_int
+          unless value >= 0 && value <= 0xffff
+            raise MalformedMessage, "#{name} is outside 16-bit range"
+          end
+          value
+        end
+
+        def check_uint48(value, name)
+          value = value.to_int
+          unless value >= 0 && value <= 0xffffffffffff
+            raise MalformedMessage, "#{name} is outside 48-bit range"
+          end
+          value
+        end
+
+        def resolve_time(value)
+          value = value.call if value.respond_to?(:call)
+          value = Time.now.to_i if value.nil?
+          check_uint48(value, 'TSIG time')
+        end
+
+        def wire_for(message)
+          case message
+          when Message
+            (message.raw || message.encode).b
+          when String
+            message.b
+          else
+            raise ArgumentError, 'DNS message must be a Resolv::DNS::Message or binary String'
+          end
+        end
+
+        def prefix_mac(digest, request_mac)
+          return if request_mac.nil?
+          request_mac = request_mac.b
+          unless request_mac.bytesize <= 0xffff
+            raise ArgumentError, 'TSIG request MAC is too long'
+          end
+          digest.update([request_mac.bytesize].pack('n'))
+          digest.update(request_mac)
+        end
+
+        def time_data(time_value, fudge)
+          [time_value >> 32, time_value & 0xffffffff, fudge].pack('nNn')
+        end
+
+        def canonical_name(name)
+          MessageEncoder.new {|encoder|
+            name.to_a.each {|label| encoder.put_label(label.downcase)}
+            encoder.put_bytes("\0".b)
+          }.to_s
+        end
+
+        def unsigned_with_id(wire, original_id)
+          result = wire.b
+          result[0, 2] = [original_id].pack('n')
+          result
+        end
+
+        def ensure_without_tsig(wire)
+          _wire, tsig = locate_tsig(wire, false)
+          raise MalformedMessage, 'message already has TSIG' if tsig
+        end
+
+        def append_tsig(unsigned, owner, original_id, time_value, fudge, error, other_data, mac)
+          message = Message.decode(unsigned)
+          record = Resource::TSIG.new(
+            HMAC_SHA256,
+            time_value,
+            fudge,
+            mac,
+            original_id,
+            error,
+            other_data
+          )
+          message.add_additional(owner, 0, record)
+          signed = message.encode
+          decoded = Message.decode(signed)
+          decoded.raw = signed
+          signed
+        end
+
+        def extract_signed(wire)
+          wire, tsig = locate_tsig(wire, true)
+          unsigned = wire.byteslice(0, tsig[:rr_start]).b
+          unsigned[0, 2] = [tsig[:record].original_id].pack('n')
+          arcount, = unsigned.unpack('@10n')
+          raise MalformedMessage, 'signed message has no additional records' if arcount.zero?
+          unsigned[10, 2] = [arcount - 1].pack('n')
+          message = Message.decode(wire)
+          {
+            wire: wire,
+            unsigned: unsigned,
+            owner: tsig[:owner],
+            record: tsig[:record],
+            rr_start: tsig[:rr_start],
+            message: message
+          }
+        end
+
+        def locate_tsig(wire, required)
+          raise MalformedMessage, 'DNS message is too short' if wire.bytesize < 12
+          decoder = MessageDecoder.new(wire) {}
+          _id, _flags, qdcount, ancount, nscount, arcount = decoder.get_unpack('nnnnnn')
+          qdcount.times { skip_question(decoder) }
+          ancount.times { skip_non_tsig_record(decoder) }
+          nscount.times { skip_non_tsig_record(decoder) }
+
+          arcount.times do |index|
+            rr_start = decoder.index
+            owner = decoder.get_name
+            type, klass, ttl = decoder.get_unpack('nnN')
+            length, = decoder.get_unpack('n')
+            if type == Resource::TSIG::TypeValue
+              raise MalformedMessage, 'TSIG owner name must not be compressed' if wire.getbyte(rr_start) >= 0xc0
+              raise MalformedMessage, 'TSIG must be the last additional record' unless index == arcount - 1
+              raise MalformedMessage, 'invalid TSIG resource record header' unless klass == Resource::TSIG::ClassValue && ttl.zero?
+              rdata_start = decoder.index
+              raise MalformedMessage, 'TSIG algorithm name must not be compressed' if wire.getbyte(rdata_start) >= 0xc0
+              record = Resource::TSIG.decode_rdata(decoder)
+              raise MalformedMessage, 'TSIG must be the last record of the message' unless decoder.index == wire.bytesize
+              return [wire, {owner: owner, record: record, rr_start: rr_start}]
+            end
+            decoder.get_bytes(length)
+          end
+
+          raise MalformedMessage, 'message is not TSIG signed' if required
+          [wire, nil]
+        rescue DecodeError
+          raise MalformedMessage, 'malformed DNS message'
+        end
+
+        def skip_question(decoder)
+          decoder.get_name
+          decoder.get_unpack('nn')
+        end
+
+        def skip_non_tsig_record(decoder)
+          decoder.get_name
+          type, _klass, _ttl = decoder.get_unpack('nnN')
+          length, = decoder.get_unpack('n')
+          raise MalformedMessage, 'TSIG must be in the additional section' if type == Resource::TSIG::TypeValue
+          decoder.get_bytes(length)
+        end
+      end
+
+      extend Helpers
+
+      class Key
+        def self.base64(name, secret, algorithm: HMAC_SHA256)
+          unless String === secret && secret =~ /\A(?:[A-Za-z0-9+\/]{4})*(?:[A-Za-z0-9+\/]{2}==|[A-Za-z0-9+\/]{3}=)?\z/
+            raise ArgumentError, 'invalid Base64 TSIG secret'
+          end
+          new(name, secret.unpack1('m0'), algorithm: algorithm)
+        end
+
+        def initialize(name, secret, algorithm: HMAC_SHA256)
+          name = Name.create(name)
+          raise ArgumentError, 'TSIG key name must be absolute' unless name.absolute?
+          unless String === secret && secret.encoding == Encoding::BINARY
+            raise ArgumentError, 'TSIG secret must be a binary string'
+          end
+          raise ArgumentError, 'TSIG secret cannot be empty' if secret.empty?
+          @name = name
+          @secret = secret.dup.freeze
+          @algorithm = normalize_algorithm(algorithm)
+        end
+
+        attr_reader :name, :algorithm
+
+        def ==(other)
+          Key === other &&
+            name == other.name &&
+            algorithm == other.algorithm &&
+            send(:secret_equal?, other)
+        end
+        alias eql? ==
+
+        def hash
+          [name, algorithm, secret].hash
+        end
+
+        def inspect
+          "#<#{self.class} name=#{name} algorithm=#{algorithm}>"
+        end
+        alias to_s inspect
+
+        private
+
+        attr_reader :secret
+
+        def secret_equal?(other)
+          secret == other.send(:secret)
+        end
+
+        def normalize_algorithm(algorithm)
+          value = Name.create(algorithm.to_s.downcase)
+          raise BadAlgorithm, 'unsupported TSIG algorithm' unless value == Name.create(HMAC_SHA256)
+          value
+        end
+      end
+
+      class Signer
+        include Helpers
+        def initialize(key, fudge: DEFAULT_FUDGE, time: nil)
+          raise ArgumentError, 'TSIG key required' unless key.is_a?(Key)
+          @key = key
+          @fudge = check_fudge(fudge)
+          @time = time
+        end
+
+        attr_reader :key, :fudge
+
+        def sign(message, request_mac: nil, original_id: nil, time: @time, error: 0, other_data: ''.b)
+          context = SignContext.new(key, fudge: fudge)
+          context.prefix(request_mac)
+          context.sign(message, original_id: original_id, time: time, error: error, other_data: other_data)
+        end
+      end
+
+      class Verifier
+        include Helpers
+        def initialize(key, fudge: DEFAULT_FUDGE, time: nil)
+          raise ArgumentError, 'TSIG key required' unless key.is_a?(Key)
+          @key = key
+          @fudge = check_fudge(fudge)
+          @time = time
+        end
+
+        attr_reader :key, :fudge
+
+        def verify(message, request_mac: nil, original_id: nil, time: @time)
+          context = VerifyContext.new(key, fudge: fudge)
+          context.prefix(request_mac)
+          context.verify(message, original_id: original_id, time: time)
+        end
+      end
+
+      class Context
+        include Helpers
+
+        def initialize(key, fudge = DEFAULT_FUDGE)
+          raise ArgumentError, 'TSIG key required' unless key.is_a?(Key)
+          @key = key
+          @fudge = check_fudge(fudge)
+          @mutex = Thread::Mutex.new
+          @digest = new_digest
+          @prefixed = false
+          @open = false
+          @finished = false
+          @poisoned = false
+        end
+
+        attr_reader :key, :fudge
+
+        def prefix(request_mac)
+          synchronize do
+            raise ContextError, 'TSIG context already started' if @prefixed || @open
+            prefix_mac(@digest, request_mac)
+            @prefixed = true
+            self
+          end
+        end
+
+        def update(message)
+          synchronize do
+            ensure_usable
+            wire = wire_for(message)
+            ensure_without_tsig(wire)
+            @digest.update(wire)
+            self
+          rescue Error
+            @poisoned = true
+            raise
+          end
+        end
+
+        private
+
+        def synchronize(&block)
+          @mutex.synchronize(&block)
+        end
+
+        def ensure_prefixed
+          raise ContextError, 'TSIG context has no request MAC prefix' unless @prefixed
+        end
+
+        def ensure_usable
+          raise ContextError, 'TSIG context cannot be reused after an authentication failure' if @poisoned
+          ensure_prefixed
+          raise ContextError, 'TSIG context is finished' if @finished
+        end
+
+        def new_digest
+          OpenSSL::HMAC.new(key.send(:secret), 'SHA256')
+        end
+      end
+
+      class SignContext < Context
+        def initialize(key, fudge: DEFAULT_FUDGE, request_mac: nil)
+          super(key, fudge)
+          prefix(request_mac) unless request_mac.nil?
+          @signed = false
+        end
+
+        def sign(message, original_id: nil, time: nil, error: 0, other_data: ''.b)
+          synchronize do
+            ensure_usable
+            raise ContextError, 'TSIG context has already signed the first message' if @signed
+            @open = true
+            @signed = true
+            wire = wire_for(message)
+            ensure_without_tsig(wire)
+            time_value = resolve_time(time)
+            id = original_id || Message.decode(wire).id
+            error = check_uint16(error, 'TSIG error')
+            other_data = other_data.b
+            unless other_data.bytesize <= 0xffff
+              raise ArgumentError, 'TSIG other data is too long'
+            end
+            unsigned = unsigned_with_id(wire, id)
+            @digest.update(unsigned)
+            @digest.update(canonical_name(key.name))
+            @digest.update([Resource::TSIG::ClassValue, 0].pack('nN'))
+            @digest.update(canonical_name(key.algorithm))
+            @digest.update(time_data(time_value, fudge))
+            @digest.update([error, other_data.bytesize].pack('nn'))
+            @digest.update(other_data)
+            mac = @digest.digest
+            signed = append_tsig(unsigned, key.name, id, time_value, fudge, error, other_data, mac)
+            signed
+          rescue Error
+            @poisoned = true
+            raise
+          end
+        end
+
+        def update(message)
+          synchronize do
+            ensure_usable
+            raise ContextError, 'TSIG context cannot update after signing its first message' if @signed
+            wire = wire_for(message)
+            ensure_without_tsig(wire)
+            @digest.update(wire)
+            self
+          rescue Error
+            @poisoned = true
+            raise
+          end
+        end
+
+        def finish(message, original_id: nil, time: nil)
+          synchronize do
+            ensure_usable
+            raise ContextError, 'TSIG context cannot update after signing its first message' if @signed
+            @finished = true
+            @open = true
+            wire = wire_for(message)
+            ensure_without_tsig(wire)
+            id = original_id || Message.decode(wire).id
+            unsigned = unsigned_with_id(wire, id)
+            time_value = resolve_time(time)
+            @digest.update(unsigned)
+            @digest.update(time_data(time_value, fudge))
+            mac = @digest.digest
+            append_tsig(unsigned, key.name, id, time_value, fudge, 0, ''.b, mac)
+          rescue Error
+            @poisoned = true
+            raise
+          end
+        end
+
+      end
+      class VerifyContext < Context
+        def initialize(key, fudge: DEFAULT_FUDGE, request_mac: nil)
+          super(key, fudge)
+          prefix(request_mac) unless request_mac.nil?
+        end
+
+        def verify(message, original_id: nil, time: nil)
+          synchronize do
+            ensure_usable
+            raise ContextError, 'TSIG context has already verified the first message' if @open
+            @open = true
+            begin
+              verify_signed(wire_for(message), original_id, resolve_time(time), true)
+            rescue Error
+              @poisoned = true
+              raise
+            end
+          end
+        end
+
+        def update(message)
+          synchronize do
+            ensure_usable
+            wire = wire_for(message)
+            ensure_without_tsig(wire)
+            @digest.update(wire)
+            self
+          rescue Error
+            @poisoned = true
+            raise
+          end
+        end
+
+        def finish(message, original_id: nil, time: nil)
+          synchronize do
+            ensure_usable
+            @finished = true
+            @open = true
+            begin
+              verify_signed(wire_for(message), original_id, resolve_time(time), false)
+            rescue Error
+              @poisoned = true
+              raise
+            end
+          end
+        end
+
+        def verify_signed(wire, original_id, time_value, first)
+          result = TSIG.extract_signed(wire)
+          record = result[:record]
+          check_common(record, result[:owner])
+          if first && !record.fudge.zero? && record.fudge != fudge
+            raise BadTime, 'TSIG fudge was not negotiated'
+          end
+          if original_id && record.original_id != original_id
+            raise BadSignature, 'TSIG original ID does not match'
+          end
+          check_time(record, time_value) unless record.error == RCode::BADTIME
+          if first
+            @digest.update(result[:unsigned])
+            @digest.update(canonical_name(key.name))
+            @digest.update([Resource::TSIG::ClassValue, 0].pack('nN'))
+            @digest.update(canonical_name(key.algorithm))
+            @digest.update(time_data(record.time_signed, record.fudge))
+            @digest.update([record.error, record.other_data.bytesize].pack('nn'))
+            @digest.update(record.other_data)
+          else
+            @digest.update(result[:unsigned])
+            @digest.update(time_data(record.time_signed, record.fudge))
+          end
+          result[:message]
+          check_mac(record, @digest.digest)
+          raise PeerError.new(record.error) unless record.error.zero?
+          result[:message]
+        end
+
+        def check_common(record, owner)
+          raise BadKey, 'TSIG key name does not match' unless owner == key.name
+          raise BadAlgorithm, 'TSIG algorithm does not match' unless record.algorithm == key.algorithm
+          check_uint48(record.time_signed, 'TSIG time')
+          check_uint16(record.fudge, 'TSIG fudge')
+          check_uint16(record.original_id, 'TSIG original ID')
+          check_uint16(record.error, 'TSIG error')
+          unless String === record.other_data && record.other_data.bytesize <= 0xffff
+            raise MalformedMessage, 'invalid TSIG other data'
+          end
+        end
+
+        def check_time(record, time_value)
+          difference = record.time_signed > time_value ? record.time_signed - time_value : time_value - record.time_signed
+          raise BadTime, 'TSIG timestamp is outside fudge window' if difference > record.fudge
+        end
+
+        def check_mac(record, expected)
+          unless String === record.mac
+            raise MalformedMessage, 'invalid TSIG MAC'
+          end
+          if record.mac.bytesize != MAC_SIZE
+            raise BadTruncation
+          end
+          raise BadSignature unless secure_equal?(record.mac, expected)
+        end
+
+        def secure_equal?(actual, expected)
+          if OpenSSL.respond_to?(:fixed_length_secure_compare)
+            OpenSSL.fixed_length_secure_compare(actual, expected)
+          else
+            return false unless actual.bytesize == expected.bytesize
+            result = 0
+            actual.each_byte.with_index {|byte, index| result |= byte ^ expected.getbyte(index)}
+            result.zero?
+          end
+        end
+      end
+
+
+      def self.sign(key, message, request_mac: nil, original_id: nil, time: nil, fudge: DEFAULT_FUDGE, error: 0, other_data: ''.b)
+        Signer.new(key, fudge: fudge, time: time).sign(
+          message,
+          request_mac: request_mac,
+          original_id: original_id,
+          error: error,
+          other_data: other_data
+        )
+      end
+
+      def self.verify(key, message, request_mac: nil, original_id: nil, time: nil, fudge: DEFAULT_FUDGE)
+        Verifier.new(key, fudge: fudge, time: time).verify(
+          message,
+          request_mac: request_mac,
+          original_id: original_id
+        )
+      end
+
+      def self.extract(message) # :nodoc:
+        parsed = extract_signed(wire_for(message))
+        parsed[:record]
       end
     end
   end
