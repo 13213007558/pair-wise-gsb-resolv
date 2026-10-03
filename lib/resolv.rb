@@ -1608,26 +1608,30 @@ class Resolv
       end
 
       def encode
+        return encode_sections(@tc, @answer, @authority, @additional)
+      end
+
+      private def encode_sections(tc, answer, authority, additional) # :nodoc:
         return MessageEncoder.new {|msg|
           msg.put_pack('nnnnnn',
             @id,
             (@qr & 1) << 15 |
             (@opcode & 15) << 11 |
             (@aa & 1) << 10 |
-            (@tc & 1) << 9 |
+            (tc & 1) << 9 |
             (@rd & 1) << 8 |
             (@ra & 1) << 7 |
             (@rcode & 15),
             @question.length,
-            @answer.length,
-            @authority.length,
-            @additional.length)
+            answer.length,
+            authority.length,
+            additional.length)
           @question.each {|q|
             name, typeclass = q
             msg.put_name(name)
             msg.put_pack('nn', typeclass::TypeValue, typeclass::ClassValue)
           }
-          [@answer, @authority, @additional].each {|rr|
+          [answer, authority, additional].each {|rr|
             rr.each {|r|
               name, ttl, data = r
               msg.put_name(name)
@@ -1636,6 +1640,128 @@ class Resolv
             }
           }
         }.to_s
+      end
+
+      ##
+      # Encodes the message so that the result fits within +max_size+ bytes,
+      # for use when a UDP response must not exceed the peer's size limit.
+      #
+      # Cutting the encoded bytes off at +max_size+ would leave an
+      # unparseable message, so instead whole RRsets -- every record sharing
+      # an owner name, class and type -- are selected to fit the budget and
+      # the message is re-encoded from scratch.  Name compression offsets
+      # are therefore recomputed for the records that remain and the result
+      # is always a well-formed message.  When any record is left out, the
+      # TC (truncation) bit is set in the encoded result.  The message
+      # itself is not modified.
+      #
+      # The header and the question section count against the budget first
+      # and are kept whole or not at all.  If they, together with the RRsets
+      # declared +required+, do not fit within +max_size+, EncodeError is
+      # raised rather than returning a partial question section.
+      #
+      # +priorities+ and +required+ are arrays of RRset selectors.  A
+      # selector is <code>[name, typeclass]</code>, like the arguments to
+      # #add_answer with a resource class such as Resource::IN::A; use
+      # Resource::Generic.create(type_value, class_value) for types without
+      # a dedicated class, such as RRSIG.  A selector may also be an array
+      # of selectors, declaring an indivisible group whose RRsets are kept
+      # together or dropped together, e.g. a signed RRset and its RRSIG.
+      #
+      # Selection keeps as many RRsets as the budget allows, considering
+      # +priorities+ entries most important first; RRsets not listed there
+      # rank below all listed ones, and ties are resolved by order of
+      # appearance in the message.  Kept records are always emitted in
+      # their original message order.
+      #
+      def encode_limited(max_size, priorities: [], required: [])
+        rrsets = [] # RRset match keys in order of first appearance
+        seen = {}
+        each_resource {|name, _ttl, data|
+          key = limited_rrset_key(name, data.class)
+          unless seen[key]
+            seen[key] = true
+            rrsets << key
+          end
+        }
+        appearance = {}
+        rrsets.each_with_index {|key, i| appearance[key] = i }
+
+        # Caller-declared groups become indivisible units.  Every RRset is
+        # claimed by at most one unit, required groups first.
+        claimed = {}
+        units = [] # [required?, rank, first_appearance, keys]
+        [[true, required], [false, priorities]].each {|required_flag, specs|
+          specs.each_with_index {|spec, rank|
+            keys = limited_selector_keys(spec).select {|key|
+              seen[key] && !claimed[key]
+            }
+            keys.each {|key| claimed[key] = true }
+            next if keys.empty?
+            first = keys.map {|key| appearance[key] }.min
+            units << [required_flag, rank, first, keys]
+          }
+        }
+        rrsets.each {|key|
+          next if claimed[key]
+          units << [false, priorities.length, appearance[key], [key]]
+        }
+
+        kept = {}
+        optional = []
+        units.each {|required_flag, rank, first, keys|
+          if required_flag
+            keys.each {|key| kept[key] = true }
+          else
+            optional << [rank, first, keys]
+          end
+        }
+        optional.sort_by! {|rank, first, _keys| [rank, first] }
+
+        size = encode_limited_subset(kept, @tc).bytesize
+        if size > max_size
+          raise EncodeError, "DNS message does not fit in #{max_size} bytes: " +            "header, question section and required records need #{size} bytes"
+        end
+        optional.each {|_rank, _first, keys|
+          candidate = kept.dup
+          keys.each {|key| candidate[key] = true }
+          if encode_limited_subset(candidate, @tc).bytesize <= max_size
+            kept = candidate
+          end
+        }
+        truncated = rrsets.any? {|key| !kept[key] }
+        return encode_limited_subset(kept, truncated ? 1 : @tc)
+      end
+
+      # Match key identifying the RRset a record belongs to: the owner name
+      # compared case-insensitively, plus the class and type values.
+      private def limited_rrset_key(name, typeclass) # :nodoc:
+        return [name.to_a.map {|label| label.downcase },
+                typeclass::TypeValue, typeclass::ClassValue]
+      end
+
+      # Normalizes one +priorities+/+required+ entry into a list of RRset
+      # match keys.  A bare +[name, typeclass]+ selector keeps a single
+      # RRset; an array of selectors declares an indivisible group.
+      private def limited_selector_keys(spec) # :nodoc:
+        selectors = spec.is_a?(Array) && spec.first.is_a?(Array) ? spec : [spec]
+        return selectors.map {|name, typeclass|
+          limited_rrset_key(Name.create(name), typeclass)
+        }
+      end
+
+      # Encodes the records whose RRsets are in +kept+, preserving their
+      # original order, with the TC bit overridden by +tc+.
+      private def encode_limited_subset(kept, tc) # :nodoc:
+        select = lambda {|records|
+          records.select {|name, _ttl, data|
+            kept[limited_rrset_key(name, data.class)]
+          }
+        }
+        return encode_sections(tc,
+                               select.call(@answer),
+                               select.call(@authority),
+                               select.call(@additional))
       end
 
       class MessageEncoder # :nodoc:

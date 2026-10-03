@@ -1599,4 +1599,298 @@ class TestResolvDNS < Test::Unit::TestCase
       end
     end
   end
+
+  # --- Message#encode_limited -------------------------------------------
+
+  def limited_test_message
+    m = Resolv::DNS::Message.new(0x1234)
+    m.qr = 1
+    m.aa = 1
+    m.rd = 1
+    m.ra = 1
+    m.add_question("foo.example.org", Resolv::DNS::Resource::IN::A)
+    m.add_answer("foo.example.org", 300, Resolv::DNS::Resource::IN::A.new("192.0.2.1"))
+    m.add_answer("foo.example.org", 300, Resolv::DNS::Resource::IN::A.new("192.0.2.2"))
+    m.add_answer("bar.example.org", 300, Resolv::DNS::Resource::IN::A.new("192.0.2.3"))
+    m.add_authority("example.org", 300, Resolv::DNS::Resource::IN::NS.new(Resolv::DNS::Name.create("ns.example.org")))
+    m.add_additional("ns.example.org", 300, Resolv::DNS::Resource::IN::A.new("192.0.2.4"))
+    return m
+  end
+
+  def limited_rrset_key(name, data)
+    return [name.to_a.map {|label| label.downcase },
+            data.class::TypeValue, data.class::ClassValue]
+  end
+
+  def limited_rrsets_of(template)
+    rrsets = []
+    template.each_resource {|name, _ttl, data|
+      key = limited_rrset_key(name, data)
+      rrsets << key unless rrsets.include?(key)
+    }
+    return rrsets
+  end
+
+  # Encodes +template+ restricted to the RRsets in +kept_keys+ through the
+  # plain public API, providing an independent reference encoding.
+  def limited_reference_encode(template, kept_keys, tc)
+    sub = Resolv::DNS::Message.new(template.id)
+    sub.qr = template.qr
+    sub.opcode = template.opcode
+    sub.aa = template.aa
+    sub.tc = tc
+    sub.rd = template.rd
+    sub.ra = template.ra
+    sub.rcode = template.rcode
+    template.each_question {|name, typeclass| sub.add_question(name, typeclass) }
+    template.each_answer {|name, ttl, data|
+      sub.add_answer(name, ttl, data) if kept_keys.include?(limited_rrset_key(name, data))
+    }
+    template.each_authority {|name, ttl, data|
+      sub.add_authority(name, ttl, data) if kept_keys.include?(limited_rrset_key(name, data))
+    }
+    template.each_additional {|name, ttl, data|
+      sub.add_additional(name, ttl, data) if kept_keys.include?(limited_rrset_key(name, data))
+    }
+    return sub.encode
+  end
+
+  # Expands +priorities+/+required+ specs into indivisible units of RRset
+  # keys, in selection order: required first, then by priority rank, ties
+  # broken by order of appearance in the message.
+  def limited_units(template, priorities, required)
+    rrsets = limited_rrsets_of(template)
+    claimed = {}
+    units = []
+    [[required, true], [priorities, false]].each {|specs, required_flag|
+      specs.each_with_index {|spec, rank|
+        selectors = spec.is_a?(Array) && spec.first.is_a?(Array) ? spec : [spec]
+        keys = selectors.map {|name, typeclass|
+          [Resolv::DNS::Name.create(name).to_a.map {|label| label.downcase },
+           typeclass::TypeValue, typeclass::ClassValue]
+        }.select {|key| rrsets.include?(key) && !claimed[key] }
+        keys.each {|key| claimed[key] = true }
+        next if keys.empty?
+        first = keys.map {|key| rrsets.index(key) }.min
+        units << [required_flag, required_flag ? -1 : rank, first, keys]
+      }
+    }
+    rrsets.each_with_index {|key, i|
+      next if claimed[key]
+      units << [false, priorities.length, i, [key]]
+    }
+    return units.sort_by {|required_flag, rank, first, _keys|
+      [required_flag ? -1 : rank, first]
+    }
+  end
+
+  # Decodes a possibly truncated result of encode_limited: the stock
+  # decoder refuses TC messages, so the bit is cleared after being read.
+  def limited_decode(result)
+    _id, flags, qdcount, ancount, nscount, arcount = result.unpack("nnnnnn")
+    body = result.dup
+    body.setbyte(2, body.getbyte(2) & ~0x02)
+    decoded = Resolv::DNS::Message.decode(body)
+    assert_equal(qdcount, decoded.question.length)
+    assert_equal(ancount, decoded.answer.length)
+    assert_equal(nscount, decoded.authority.length)
+    assert_equal(arcount, decoded.additional.length)
+    return decoded, (flags >> 9) & 1
+  end
+
+  def limited_kept_keys(decoded)
+    kept = []
+    decoded.each_resource {|name, _ttl, data|
+      key = limited_rrset_key(name, data)
+      kept << key unless kept.include?(key)
+    }
+    return kept
+  end
+
+  def test_encode_limited_full_budget_matches_encode
+    template = limited_test_message
+    assert_equal(template.encode, template.encode_limited(template.encode.bytesize))
+    assert_equal(template.encode, template.encode_limited(template.encode.bytesize + 100))
+  end
+
+  def test_encode_limited_per_byte_budget
+    template = limited_test_message
+    full = template.encode
+    priorities = [
+      ["ns.example.org", Resolv::DNS::Resource::IN::A],
+      ["foo.example.org", Resolv::DNS::Resource::IN::A],
+    ]
+    units = limited_units(template, priorities, [])
+    rrsets = limited_rrsets_of(template)
+    base_size = limited_reference_encode(template, [], 0).bytesize
+
+    (0..full.bytesize + 1).each {|budget|
+      if budget < base_size
+        # Not even the header and the whole question section fit: fail
+        # rather than returning a partial question section.
+        assert_raise(Resolv::DNS::EncodeError, "budget " + budget.to_s) {
+          template.encode_limited(budget, priorities: priorities)
+        }
+        next
+      end
+      result = template.encode_limited(budget, priorities: priorities)
+      assert_operator(result.bytesize, :<=, budget, "budget " + budget.to_s)
+
+      decoded, tc = limited_decode(result)
+      assert_equal(1, decoded.question.length, "budget " + budget.to_s)
+      kept = limited_kept_keys(decoded)
+
+      # Greedy invariant over the legal subsets: walking the units in
+      # selection order, a unit is kept exactly when it still fits with
+      # what was kept before it.  Sizes come from the independent
+      # reference encoding, so every legal subset is covered.
+      available = []
+      units.each {|_required, _rank, _first, keys|
+        candidate = available + keys
+        if limited_reference_encode(template, candidate, 0).bytesize <= budget
+          assert((keys - kept).empty?,
+                 "budget " + budget.to_s + ": fittable unit dropped: " + keys.inspect)
+          available = candidate
+        else
+          assert((keys & kept).empty?,
+                 "budget " + budget.to_s + ": unaffordable unit kept: " + keys.inspect)
+        end
+      }
+      assert_equal(available.sort, kept.sort, "budget " + budget.to_s)
+
+      # Byte-exact check against the reference encoding: section counts,
+      # record order and recomputed name compression all have to match.
+      expected_tc = (rrsets - kept).empty? ? 0 : 1
+      assert_equal(expected_tc, tc, "budget " + budget.to_s)
+      assert_equal(limited_reference_encode(template, kept, expected_tc), result,
+                   "budget " + budget.to_s)
+    }
+    # The message itself was never modified.
+    assert_equal(full, template.encode)
+    assert_equal(0, template.tc)
+  end
+
+  def test_encode_limited_required_group_must_fit
+    template = limited_test_message
+    required = [["bar.example.org", Resolv::DNS::Resource::IN::A]]
+    bar = limited_rrsets_of(template).find {|key| key[0] == %w[bar example org] }
+    needed = limited_reference_encode(template, [bar], 0).bytesize
+
+    (0...needed).each {|budget|
+      assert_raise(Resolv::DNS::EncodeError, "budget " + budget.to_s) {
+        template.encode_limited(budget, required: required)
+      }
+    }
+
+    # A required group is kept even when a group listed in priorities
+    # would otherwise have consumed the budget first.
+    priorities = [["foo.example.org", Resolv::DNS::Resource::IN::A]]
+    result = template.encode_limited(needed, priorities: priorities, required: required)
+    decoded, tc = limited_decode(result)
+    assert_equal([bar], limited_kept_keys(decoded))
+    assert_equal(1, tc)
+  end
+
+  def test_encode_limited_never_splits_an_rrset
+    template = limited_test_message
+    foo = limited_rrsets_of(template).find {|key| key[0] == %w[foo example org] }
+    base_size = limited_reference_encode(template, [], 0).bytesize
+    (base_size..template.encode.bytesize).each {|budget|
+      result = template.encode_limited(budget)
+      decoded, = limited_decode(result)
+      count = decoded.answer.count {|name, _ttl, data|
+        limited_rrset_key(name, data) == foo
+      }
+      assert_include([0, 2], count, "budget " + budget.to_s + ": RRset split")
+    }
+  end
+
+  def test_encode_limited_keeps_declared_signature_with_signed_rrset
+    rrsig = Resolv::DNS::Resource::Generic.create(46, 1) # RRSIG
+    template = Resolv::DNS::Message.new(0x1234)
+    template.add_question("foo.example.org", Resolv::DNS::Resource::IN::A)
+    template.add_answer("foo.example.org", 300, Resolv::DNS::Resource::IN::A.new("192.0.2.1"))
+    template.add_answer("foo.example.org", 300, rrsig.new(" ".b))
+    template.add_answer("bar.example.org", 300, Resolv::DNS::Resource::IN::A.new("192.0.2.2"))
+
+    a_key = limited_rrset_key(Resolv::DNS::Name.create("foo.example.org"),
+                              Resolv::DNS::Resource::IN::A.new("192.0.2.1"))
+    sig_key = limited_rrset_key(Resolv::DNS::Name.create("foo.example.org"),
+                                rrsig.new(" ".b))
+    joint = [[["foo.example.org", Resolv::DNS::Resource::IN::A],
+              ["foo.example.org", rrsig]]]
+
+    both_size = limited_reference_encode(template, [a_key, sig_key], 0).bytesize
+    a_only_size = limited_reference_encode(template, [a_key], 0).bytesize
+    assert_operator(a_only_size, :<, both_size)
+
+    # The signed RRset alone would fit, but the declared joint constraint
+    # drops it together with its signature.
+    result = template.encode_limited(both_size - 1, priorities: joint)
+    decoded, tc = limited_decode(result)
+    kept = limited_kept_keys(decoded)
+    assert_not_include(kept, a_key)
+    assert_not_include(kept, sig_key)
+    assert_equal(1, tc)
+
+    # One byte more keeps the signature and the signed RRset together.
+    result = template.encode_limited(both_size, priorities: joint)
+    decoded, = limited_decode(result)
+    kept = limited_kept_keys(decoded)
+    assert_include(kept, a_key)
+    assert_include(kept, sig_key)
+
+    # Without the joint declaration the signature is just another RRset
+    # and the signed RRset is kept on its own.
+    result = template.encode_limited(both_size - 1)
+    decoded, = limited_decode(result)
+    kept = limited_kept_keys(decoded)
+    assert_include(kept, a_key)
+    assert_not_include(kept, sig_key)
+  end
+
+  def test_encode_limited_recomputes_name_compression
+    template = limited_test_message
+    rrsets = limited_rrsets_of(template)
+    foo = rrsets.find {|key| key[0] == %w[foo example org] }
+    kept = rrsets - [foo]
+    # The dropped RRset owns the names the surviving records compress
+    # against; only freshly computed offsets decode to the right names.
+    expected = limited_reference_encode(template, kept, 1)
+    priorities = [
+      ["bar.example.org", Resolv::DNS::Resource::IN::A],
+      ["example.org", Resolv::DNS::Resource::IN::NS],
+      ["ns.example.org", Resolv::DNS::Resource::IN::A],
+    ]
+    result = template.encode_limited(expected.bytesize, priorities: priorities)
+    assert_equal(expected, result)
+    decoded, tc = limited_decode(result)
+    assert_equal(1, tc)
+    assert_equal(["bar.example.org"], decoded.answer.map {|name, _ttl, _data| name.to_s })
+    assert_equal(["example.org"], decoded.authority.map {|name, _ttl, _data| name.to_s })
+    assert_equal(["ns.example.org"], decoded.additional.map {|name, _ttl, _data| name.to_s })
+  end
+
+  def test_encode_limited_leaves_message_unmodified
+    template = limited_test_message
+    before = template.encode
+    base_size = limited_reference_encode(template, [], 0).bytesize
+    template.encode_limited(base_size)
+    assert_raise(Resolv::DNS::EncodeError) { template.encode_limited(base_size - 1) }
+    assert_equal(before, template.encode)
+    assert_equal(0, template.tc)
+    assert_equal(1, template.question.length)
+    assert_equal(3, template.answer.length)
+    assert_equal(1, template.authority.length)
+    assert_equal(1, template.additional.length)
+  end
+
+  def test_encode_limited_without_records
+    template = Resolv::DNS::Message.new(0x1234)
+    template.add_question("foo.example.org", Resolv::DNS::Resource::IN::A)
+    assert_equal(template.encode, template.encode_limited(template.encode.bytesize))
+    assert_raise(Resolv::DNS::EncodeError) {
+      template.encode_limited(template.encode.bytesize - 1)
+    }
+  end
 end
