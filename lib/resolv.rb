@@ -5,6 +5,7 @@ require 'timeout'
 require 'io/wait' if RUBY_VERSION < '3.2'
 require 'securerandom'
 require 'rbconfig'
+require 'digest'
 
 # Resolv is a thread-aware DNS resolver library written in Ruby.  Resolv can
 # handle multiple DNS requests concurrently without blocking the entire Ruby
@@ -1901,6 +1902,706 @@ class Resolv
           res.instance_variable_set :@ttl, ttl
           return name, ttl, res
         end
+      end
+    end
+
+    ##
+    # TSIG (Transaction SIGnature) signing and verification of DNS messages.
+    # [RFC 8945]
+    #
+    # A TSIG authenticates a DNS message exchange between two parties
+    # sharing a secret key, typically a resolver and an authoritative
+    # server on an internal network.  Each signed message carries a TSIG
+    # record holding a message authentication code (MAC) as the last
+    # record of its additional section.
+    #
+    # Single request/response pairs are handled by the TSIG.sign and
+    # TSIG.verify module functions:
+    #
+    #   key = Resolv::DNS::TSIG::Key.new('tsig-key.example.', secret)
+    #   wire = Resolv::DNS::TSIG.sign(message, key)
+    #   reply = Resolv::DNS::TSIG.verify(reply_wire, key)
+    #
+    # TCP conversations such as zone transfers span multiple DNS
+    # messages.  Their MACs are chained: the MAC of each signed message
+    # covers the MAC of the previous signed message and any unsigned
+    # messages in between, so verifying every message in isolation
+    # cannot replace verifying the whole chain.  TSIG::Context maintains
+    # this authentication state for one conversation; create a separate
+    # context for every transfer and never share one between concurrent
+    # transfers:
+    #
+    #   context = Resolv::DNS::TSIG::Context.new(key)
+    #   wire = context.sign(query)
+    #   # ... send wire, receive replies ...
+    #   reply = context.verify(reply_wire)
+    #
+    # Only the HMAC-SHA256 algorithm is supported.  [RFC 4635]
+    class TSIG
+      # TSIG resource record type.  [RFC 8945 4.2]
+      TypeValue = 250
+
+      # TSIG records always use class ANY.
+      ClassValue = 255
+
+      # The HMAC-SHA256 TSIG algorithm name.  [RFC 8945 4.3.2]
+      HMAC_SHA256 = Name.create('hmac-sha256')
+
+      # Default fudge factor: the accepted difference in seconds between
+      # the signer clock and the verifier clock.
+      DEFAULT_FUDGE = 300
+
+      # Full HMAC-SHA256 output size in octets.
+      HMAC_SHA256_MAC_SIZE = 32
+
+      # Shortest truncated MAC accepted for HMAC-SHA256: half of the
+      # full output, which also satisfies the 80-bit floor for truncated
+      # HMAC output.  [RFC 2104 5, RFC 4635 3.1]
+      HMAC_SHA256_MINIMUM_MAC_SIZE = 16
+
+      # TSIG error field value reported when the signer clock is outside
+      # the fudge factor of the verifier clock.
+      ERROR_BADTIME = 18
+
+      # TSIG error field values a peer can report.  [RFC 8945 4.5]
+      REMOTE_ERRORS = {
+        16 => 'BADSIG',
+        17 => 'BADKEY',
+        18 => 'BADTIME',
+        22 => 'BADTRUNC',
+        23 => 'BADCOOKIE',
+      }.freeze
+
+      ##
+      # Base class for TSIG errors.  Error messages never include key
+      # material.
+
+      class Error < ResolvError; end
+
+      ##
+      # Raised when no key is known for the key name of a TSIG record.
+
+      class UnknownKeyError < Error; end
+
+      ##
+      # Raised for TSIG algorithms other than HMAC-SHA256.
+
+      class UnsupportedAlgorithmError < Error; end
+
+      ##
+      # Base class for TSIG verification failures.
+
+      class VerificationError < Error; end
+
+      ##
+      # Raised when a message that must be signed carries no TSIG record.
+
+      class NotSignedError < VerificationError; end
+
+      ##
+      # Raised when the MAC of a message does not match its content.
+
+      class BadSignatureError < VerificationError; end
+
+      ##
+      # Raised when the signed time is outside the fudge factor.
+
+      class BadTimeError < VerificationError; end
+
+      ##
+      # Raised when the MAC size is not one of the lengths accepted for
+      # the algorithm, for example an over-aggressively truncated MAC.
+
+      class BadMacLengthError < VerificationError; end
+
+      ##
+      # Raised when the peer reports a TSIG error such as BADKEY or
+      # BADTIME in the error field of a verified TSIG record.
+
+      class RemoteError < VerificationError; end
+
+      ##
+      # A shared secret TSIG key, identified by its key name.
+      #
+      # The secret is never included in #inspect output or in any
+      # exception message.
+
+      class Key
+        ##
+        # The key name as a Resolv::DNS::Name.
+
+        attr_reader :name
+
+        ##
+        # The algorithm name as a Resolv::DNS::Name.  Always
+        # +hmac-sha256+ for now.
+
+        attr_reader :algorithm
+
+        ##
+        # Creates a TSIG key.  +name+ is the key name, +secret+ the
+        # shared secret as a binary string, and +algorithm+ the
+        # algorithm name (+hmac-sha256+, also accepted as the
+        # :hmac_sha256 symbol).
+
+        def initialize(name, secret, algorithm: HMAC_SHA256)
+          @name = Name.create(name)
+          @secret = secret.to_s.b.freeze
+          algorithm = Name.create(algorithm.to_s.tr('_', '-')) unless Name === algorithm
+          unless TSIG.canonical_name(algorithm) == TSIG.canonical_name(HMAC_SHA256)
+            raise UnsupportedAlgorithmError, "unsupported TSIG algorithm: #{algorithm}"
+          end
+          @algorithm = algorithm
+        end
+
+        ##
+        # The range of MAC sizes in octets accepted for this key, from
+        # the shortest permitted truncation to the full HMAC output.
+
+        def mac_size_range
+          HMAC_SHA256_MINIMUM_MAC_SIZE..HMAC_SHA256_MAC_SIZE
+        end
+
+        def hmac(data) # :nodoc:
+          TSIG.hmac_sha256(@secret, data)
+        end
+
+        def inspect # :nodoc:
+          # The secret is key material and must not show up in logs.
+          "#<#{self.class} name=#{name.to_s.inspect} algorithm=#{algorithm}>"
+        end
+      end
+
+      ##
+      # A set of TSIG keys looked up by key name.  Verification selects
+      # the key named by the TSIG record of the received message;
+      # KeyRing#fetch selects a key explicitly.
+
+      class KeyRing
+        include Enumerable
+
+        def initialize(keys = [])
+          @keys = {}
+          keys.each {|key| add(key) }
+        end
+
+        ##
+        # Adds +key+ to the ring, replacing any key with the same name.
+
+        def add(key)
+          @keys[TSIG.canonical_name(key.name)] = key
+          self
+        end
+
+        ##
+        # Returns the key named +name+, or nil.
+
+        def [](name)
+          @keys[TSIG.canonical_name(name)]
+        end
+
+        ##
+        # Returns the key named +name+, or raises UnknownKeyError.
+
+        def fetch(name)
+          self[name] or
+            raise UnknownKeyError, "no TSIG key named #{Name.create(name).to_s.inspect}"
+        end
+
+        def each(&block) # :nodoc:
+          @keys.each_value(&block)
+        end
+
+        def size # :nodoc:
+          @keys.size
+        end
+      end
+
+      ##
+      # A TSIG record parsed from a received message.
+
+      class Record
+        ##
+        # The key name from the record owner name.
+
+        attr_reader :key_name
+
+        ##
+        # The algorithm name.
+
+        attr_reader :algorithm
+
+        ##
+        # Seconds since the epoch when the message was signed.
+
+        attr_reader :time_signed
+
+        ##
+        # The fudge factor in seconds used by the signer.
+
+        attr_reader :fudge
+
+        ##
+        # The message authentication code, possibly truncated.
+
+        attr_reader :mac
+
+        ##
+        # The message ID of the original message, preserved across
+        # forwarders that rewrite the ID.
+
+        attr_reader :original_id
+
+        ##
+        # The TSIG error field.
+
+        attr_reader :error
+
+        ##
+        # The other data field, empty unless the error field uses it.
+
+        attr_reader :other_data
+
+        def initialize(key_name, algorithm, time_signed, fudge, mac, original_id, error, other_data) # :nodoc:
+          @key_name = key_name
+          @algorithm = algorithm
+          @time_signed = time_signed
+          @fudge = fudge
+          @mac = mac
+          @original_id = original_id
+          @error = error
+          @other_data = other_data
+        end
+      end
+
+      ##
+      # The TSIG authentication state of one DNS conversation, such as
+      # one TCP connection carrying a zone transfer.  [RFC 8945 4.4]
+      #
+      # The MAC of each signed message in a conversation covers the MAC
+      # of the previous signed message and every unsigned message since,
+      # so a tampered message breaks the authentication of the whole
+      # chain from that point on.  A context is stateful and belongs to
+      # a single conversation: create a separate context for every
+      # transfer, and never reuse one across concurrent transfers.
+      #
+      #   context = Resolv::DNS::TSIG::Context.new(key)
+      #   request_wire = context.sign(query)
+      #   # ... exchange length-prefixed messages over TCP ...
+      #   reply = context.verify(reply_wire)
+      #
+      # The clock used for the time signed and fudge checks can be
+      # pinned with the +time_source+ parameter, which is useful for
+      # testing:
+      #
+      #   context = Resolv::DNS::TSIG::Context.new(key, time_source: -> { FIXED_TIME })
+      #
+      class Context
+        ##
+        # The keys accepted when verifying incoming messages.
+
+        attr_reader :keyring
+
+        ##
+        # The fudge factor in seconds used when signing.
+
+        attr_reader :fudge
+
+        ##
+        # Creates the TSIG authentication context for one conversation.
+        #
+        # +key+ is the TSIG::Key used to sign outgoing messages; it may
+        # be nil for a context that only verifies.  +keys+ is a
+        # TSIG::Key, a TSIG::KeyRing, or an Array of keys accepted when
+        # verifying; it defaults to +key+.  +fudge+ is the fudge factor
+        # in seconds used when signing.  +mac_length+ truncates the MAC
+        # of outgoing messages to the given number of octets and must
+        # stay within Key#mac_size_range.  +time_source+ is a callable
+        # returning the current time as a Time or as seconds since the
+        # epoch, and defaults to the system clock.  +request_mac+ is the
+        # MAC of the TSIG-signed request this conversation answers, for
+        # a context created to handle the response side of a single
+        # request/response exchange.
+
+        def initialize(key = nil, keys: nil, fudge: DEFAULT_FUDGE, mac_length: nil, time_source: nil, request_mac: nil)
+          @key = key
+          @keyring = TSIG.keyring_of(keys || (key ? [key] : []))
+          @fudge = fudge
+          @mac_length = mac_length
+          @time_source = time_source
+          @prior_mac = nil
+          @signed_count = 0
+          @unsigned_messages = []
+          if request_mac
+            @prior_mac = request_mac
+            @signed_count = 1
+          end
+        end
+
+        ##
+        # Returns +message+ in wire format.  By default the message is
+        # signed and carries a TSIG record.  With <tt>tsig: false</tt>
+        # the message goes out unsigned and is folded into the
+        # authentication chain: the next signed message covers it.
+        # Only messages after the first signed message of the
+        # conversation may go unsigned.
+        #
+        # +error+ and +other_data+ set the TSIG error and other data
+        # fields.  +original_id+ preserves the ID of the original
+        # message when a forwarder has rewritten it, and defaults to
+        # the ID of +message+.
+
+        def sign(message, tsig: true, error: 0, other_data: +'', original_id: nil)
+          @key or raise Error, 'this TSIG context has no signing key'
+          wire = message.encode.b
+          unless tsig
+            if @signed_count.zero?
+              raise Error, 'the first message of a TSIG conversation must be signed'
+            end
+            @unsigned_messages << wire
+            return wire
+          end
+          if @mac_length && !@key.mac_size_range.cover?(@mac_length)
+            raise ArgumentError, "TSIG mac_length #{@mac_length} is outside the accepted range #{@key.mac_size_range} for #{@key.algorithm}"
+          end
+          original_id = message.id if original_id.nil?
+          other_data = other_data.b
+          time_signed = current_time
+          mac = TSIG.compute_mac(@key, wire,
+                                 original_id: original_id,
+                                 time_signed: time_signed,
+                                 fudge: @fudge,
+                                 error: error,
+                                 other_data: other_data,
+                                 prior_mac: @prior_mac,
+                                 unsigned_messages: @unsigned_messages,
+                                 full_variables: full_variables?)
+          mac = mac.byteslice(0, @mac_length) if @mac_length
+          rr = TSIG.encode_rr(@key, time_signed, @fudge, mac, original_id, error, other_data)
+          @prior_mac = mac
+          @signed_count += 1
+          @unsigned_messages.clear
+          TSIG.append_rr(wire, rr)
+        end
+
+        ##
+        # Verifies a received message in wire format and returns it as
+        # a Resolv::DNS::Message.  Raises a VerificationError if the
+        # message fails authentication.
+        #
+        # An unsigned message is buffered and returned as-is: it is
+        # authenticated retroactively by the next signed message of the
+        # conversation.  Pass <tt>allow_unsigned: false</tt> to reject
+        # unsigned messages instead, for example in a single
+        # request/response exchange.
+
+        def verify(wire, allow_unsigned: true)
+          wire = wire.b
+          extracted = TSIG.extract(wire)
+          unless extracted
+            unless allow_unsigned && @signed_count > 0
+              raise NotSignedError, 'received an unsigned DNS message where a TSIG-signed message was required'
+            end
+            @unsigned_messages << wire
+            return Message.decode(wire)
+          end
+          record, stripped_wire, message = extracted
+          key = @keyring.fetch(record.key_name)
+          unless TSIG.canonical_name(record.algorithm) == TSIG.canonical_name(key.algorithm)
+            raise UnsupportedAlgorithmError, "unsupported TSIG algorithm: #{record.algorithm}"
+          end
+          unless key.mac_size_range.cover?(record.mac.bytesize)
+            raise BadMacLengthError, "TSIG MAC size #{record.mac.bytesize} octets is outside the accepted range #{key.mac_size_range} for #{record.algorithm}"
+          end
+          expected = TSIG.compute_mac(key, stripped_wire,
+                                      original_id: record.original_id,
+                                      time_signed: record.time_signed,
+                                      fudge: record.fudge,
+                                      error: record.error,
+                                      other_data: record.other_data,
+                                      prior_mac: @prior_mac,
+                                      unsigned_messages: @unsigned_messages,
+                                      full_variables: full_variables?)
+          unless TSIG.secure_compare(expected.byteslice(0, record.mac.bytesize), record.mac)
+            raise BadSignatureError, "TSIG MAC verification failed for key #{record.key_name.to_s.inspect}"
+          end
+          now = current_time
+          if record.error != ERROR_BADTIME && (now - record.time_signed).abs > record.fudge
+            raise BadTimeError, "TSIG time signed #{record.time_signed} is outside the fudge factor (#{record.fudge} seconds) of local time #{now}"
+          end
+          unless record.error.zero?
+            name = REMOTE_ERRORS[record.error] || 'unknown'
+            raise RemoteError, "TSIG error #{record.error} (#{name}) reported by peer for key #{record.key_name.to_s.inspect}"
+          end
+          @prior_mac = record.mac
+          @signed_count += 1
+          @unsigned_messages.clear
+          message
+        end
+
+        # The first two signed messages of a conversation, the request
+        # and the first message of the response, are digested with the
+        # full TSIG variables; later messages only carry the timing
+        # variables in their MAC.  [RFC 8945 4.4]
+        private def full_variables? # :nodoc:
+          @signed_count < 2
+        end
+
+        private def current_time # :nodoc:
+          source = @time_source || -> { Time.now }
+          value = source.call
+          value.respond_to?(:to_i) ? value.to_i : Integer(value)
+        end
+      end
+
+      ##
+      # Signs +message+ with +key+ and returns the wire format
+      # including the TSIG record.  +key+ is a TSIG::Key.
+      #
+      # +time+ fixes the time signed as a Time or as seconds since the
+      # epoch, and defaults to the current time.  +request_mac+ is the
+      # MAC of the TSIG-signed request being answered.  +fudge+ is the
+      # fudge factor in seconds.  +mac_length+ truncates the MAC to the
+      # given number of octets and must stay within Key#mac_size_range.
+      # +error+ and +other_data+ set the TSIG error and other data
+      # fields.
+      #
+      # For a conversation spanning multiple messages, use
+      # TSIG::Context instead.
+
+      def self.sign(message, key, time: nil, request_mac: nil, fudge: DEFAULT_FUDGE, mac_length: nil, error: 0, other_data: +'')
+        Context.new(key, fudge: fudge, mac_length: mac_length,
+                    time_source: time && -> { time },
+                    request_mac: request_mac).
+          sign(message, error: error, other_data: other_data)
+      end
+
+      ##
+      # Verifies the TSIG record of a message in wire format and
+      # returns the message as a Resolv::DNS::Message.  +keys+ is a
+      # TSIG::Key, a TSIG::KeyRing, or an Array of keys; the key is
+      # selected by the key name of the TSIG record.  Raises a
+      # VerificationError if the message is not signed or fails
+      # authentication.
+      #
+      # +request_mac+ is the MAC of the TSIG-signed request the
+      # message answers.  +time+ fixes the local time used for the
+      # fudge check as a Time or as seconds since the epoch, and
+      # defaults to the current time.
+      #
+      # For a conversation spanning multiple messages, use
+      # TSIG::Context instead.
+
+      def self.verify(wire, keys, request_mac: nil, time: nil)
+        Context.new(keys: keys,
+                    time_source: time && -> { time },
+                    request_mac: request_mac).
+          verify(wire, allow_unsigned: false)
+      end
+
+      def self.keyring_of(keys) # :nodoc:
+        case keys
+        when KeyRing then keys
+        when Key then KeyRing.new([keys])
+        when Array then KeyRing.new(keys)
+        else
+          raise ArgumentError, "expected a TSIG::Key, TSIG::KeyRing, or Array of keys: #{keys.inspect}"
+        end
+      end
+
+      # The canonical form of a domain name: labels in wire format,
+      # downcased, without compression.  [RFC 8945 4.2]
+      def self.canonical_name_wire(name) # :nodoc:
+        wire = +''.b
+        Name.create(name).to_a.each {|label|
+          downcased = label.downcase
+          wire << downcased.bytesize.chr << downcased
+        }
+        wire << "\0"
+      end
+
+      # A case-insensitive string form of a domain name, used to match
+      # key names and algorithm names.
+      def self.canonical_name(name) # :nodoc:
+        Name.create(name).to_a.map {|label| label.downcase }.join('.')
+      end
+
+      # HMAC-SHA256 of +data+ under +key+.  [RFC 2104]
+      def self.hmac_sha256(key, data) # :nodoc:
+        block_size = 64
+        key = Digest::SHA256.digest(key) if key.bytesize > block_size
+        key = key.ljust(block_size, "\0")
+        ipad = key.bytes.map {|byte| byte ^ 0x36 }.pack('C*')
+        opad = key.bytes.map {|byte| byte ^ 0x5c }.pack('C*')
+        Digest::SHA256.digest(opad + Digest::SHA256.digest(ipad + data))
+      end
+
+      # Compares two MACs without leaking where they first differ.
+      def self.secure_compare(a, b) # :nodoc:
+        return false unless a.bytesize == b.bytesize
+        difference = 0
+        a.bytes.zip(b.bytes) {|x, y| difference |= x ^ y }
+        difference.zero?
+      end
+
+      # The MAC input is, in order: the length-prefixed MAC of the
+      # previous signed message if any, every unsigned message since,
+      # this message with its original ID, and the TSIG variables.
+      # The first two signed messages of a conversation use the full
+      # variables; later messages use only the timing variables.
+      # [RFC 8945 4.3, 4.4]
+      def self.compute_mac(key, wire, original_id:, time_signed:, fudge:, error:, other_data:, prior_mac:, unsigned_messages:, full_variables:) # :nodoc:
+        input = +''.b
+        if prior_mac
+          input << [prior_mac.bytesize].pack('n') << prior_mac
+        end
+        unsigned_messages.each {|message| input << message }
+        input << [original_id].pack('n') << wire.byteslice(2..-1)
+        if full_variables
+          input << canonical_name_wire(key.name)
+          input << [ClassValue].pack('n') << [0].pack('N')
+          input << canonical_name_wire(key.algorithm)
+        end
+        input << [(time_signed >> 32) & 0xffff, time_signed & 0xffffffff, fudge].pack('nNn')
+        if full_variables
+          input << [error, other_data.bytesize].pack('nn') << other_data
+        end
+        key.hmac(input)
+      end
+
+      # The wire format of a TSIG record.  The owner name and the
+      # algorithm name are written in canonical form, uncompressed.
+      def self.encode_rr(key, time_signed, fudge, mac, original_id, error, other_data) # :nodoc:
+        rdata = canonical_name_wire(key.algorithm)
+        rdata << [(time_signed >> 32) & 0xffff, time_signed & 0xffffffff, fudge, mac.bytesize].pack('nNnn')
+        rdata << mac
+        rdata << [original_id, error, other_data.bytesize].pack('nnn')
+        rdata << other_data
+        rr = canonical_name_wire(key.name)
+        rr << [TypeValue, ClassValue, 0, rdata.bytesize].pack('nnNn')
+        rr << rdata
+      end
+
+      # Appends the TSIG record +rr+ to the wire format message +wire+
+      # and accounts for it in the additional record count.
+      def self.append_rr(wire, rr) # :nodoc:
+        signed = +''.b
+        signed << wire.byteslice(0, 10)
+        signed << [wire.unpack('@10n')[0] + 1].pack('n')
+        signed << wire.byteslice(12..-1)
+        signed << rr
+      end
+
+      # Splits the TSIG record off a received message.  Returns nil if
+      # the message is not signed, else the parsed Record, the wire
+      # format with the record removed and the additional record count
+      # adjusted, and the decoded message.
+      def self.extract(wire) # :nodoc:
+        message = Message.decode(wire)
+        tsig_records = message.additional.select {|_name, _ttl, data| tsig_record?(data) }
+        return nil if tsig_records.empty?
+        if tsig_records.length > 1
+          raise VerificationError, 'message carries multiple TSIG records'
+        end
+        name, ttl, rdata = message.additional.last
+        unless rdata && tsig_record?(rdata)
+          raise VerificationError, 'TSIG record is not the last additional record'
+        end
+        unless ttl.zero?
+          raise VerificationError, "TSIG record TTL must be 0, got #{ttl}"
+        end
+        record = parse_record(name, rdata.data)
+        tsig_start = last_rr_offset(wire)
+        unless skip_rr(wire, tsig_start) == wire.bytesize
+          raise DecodeError, 'junk after TSIG record'
+        end
+        stripped = +''.b
+        stripped << wire.byteslice(0, 10)
+        stripped << [wire.unpack('@10n')[0] - 1].pack('n')
+        stripped << wire.byteslice(12...tsig_start)
+        [record, stripped, message]
+      end
+
+      def self.tsig_record?(data) # :nodoc:
+        data.class::TypeValue == TypeValue &&
+          data.class::ClassValue == ClassValue
+      end
+
+      def self.parse_record(key_name, rdata) # :nodoc:
+        algorithm, offset = read_uncompressed_name(rdata, 0)
+        rest = rdata.byteslice(offset..-1)
+        raise DecodeError, 'truncated TSIG rdata' if rest.bytesize < 12
+        time_hi, time_lo, fudge, mac_size = rest.unpack('nNnn')
+        mac = rest.byteslice(10, mac_size)
+        raise DecodeError, 'truncated TSIG rdata' unless mac && mac.bytesize == mac_size
+        tail = rest.byteslice(10 + mac_size..-1)
+        raise DecodeError, 'truncated TSIG rdata' if tail.bytesize < 6
+        original_id, error, other_size = tail.unpack('nnn')
+        other_data = tail.byteslice(6, other_size)
+        raise DecodeError, 'truncated TSIG rdata' unless other_data && other_data.bytesize == other_size
+        raise DecodeError, 'junk in TSIG rdata' unless 6 + other_size == tail.bytesize
+        Record.new(key_name, algorithm, (time_hi << 32) | time_lo, fudge,
+                   mac.b, original_id, error, other_data.b)
+      end
+
+      # Reads a domain name from TSIG rdata, where compression pointers
+      # are not allowed.  [RFC 8945 4.2]
+      def self.read_uncompressed_name(data, offset) # :nodoc:
+        labels = []
+        loop do
+          length = data.getbyte(offset) or raise DecodeError, 'truncated TSIG rdata'
+          offset += 1
+          break if length.zero?
+          raise DecodeError, 'compressed name in TSIG rdata' if length >= 0xc0
+          label = data.byteslice(offset, length)
+          raise DecodeError, 'truncated TSIG rdata' unless label && label.bytesize == length
+          labels << label
+          offset += length
+        end
+        begin
+          name = Name.new(labels, true)
+        rescue ArgumentError => e
+          raise DecodeError, e.message
+        end
+        [name, offset]
+      end
+
+      # The offset of the last resource record of a wire format
+      # message, which is where its TSIG record starts.
+      def self.last_rr_offset(wire) # :nodoc:
+        raise DecodeError, 'truncated message' if wire.bytesize < 12
+        _id, _flags, qdcount, ancount, nscount, arcount = wire.unpack('nnnnnn')
+        offset = 12
+        qdcount.times { offset = skip_question(wire, offset) }
+        (ancount + nscount + arcount - 1).times { offset = skip_rr(wire, offset) }
+        offset
+      end
+
+      def self.skip_name(wire, offset) # :nodoc:
+        loop do
+          length = wire.getbyte(offset) or raise DecodeError, 'truncated message'
+          if length >= 0xc0
+            raise DecodeError, 'truncated message' if offset + 2 > wire.bytesize
+            return offset + 2
+          end
+          offset += 1
+          return offset if length.zero?
+          offset += length
+        end
+      end
+
+      def self.skip_question(wire, offset) # :nodoc:
+        offset = skip_name(wire, offset)
+        raise DecodeError, 'truncated message' if offset + 4 > wire.bytesize
+        offset + 4
+      end
+
+      def self.skip_rr(wire, offset) # :nodoc:
+        offset = skip_name(wire, offset)
+        raise DecodeError, 'truncated message' if offset + 10 > wire.bytesize
+        rdlength = wire.unpack("@#{offset + 8}n")[0]
+        raise DecodeError, 'truncated message' if offset + 10 + rdlength > wire.bytesize
+        offset + 10 + rdlength
       end
     end
 
