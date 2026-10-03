@@ -38,6 +38,29 @@ Resolv::DNS.open do |dns|
 end
 ```
 
+## DNSSEC authenticated denial of existence
+
+`Resolv::DNS::DNSSEC` verifies offline whether the NSEC/NSEC3 records in a
+complete DNS response cryptographically prove NXDOMAIN, NODATA, or the
+non-existence conditions behind a wildcard match.  It does no recursion and
+never downloads trust anchors; the caller supplies already-trusted DNSKEY or
+DS records.  Signature validity and proof validity are reported separately,
+and insufficient evidence always yields `:unprovable` rather than a guess
+from an empty answer.
+
+```ruby
+result = Resolv::DNS::DNSSEC.verify_denial(
+  name: "gone.example.",
+  type: Resolv::DNS::Resource::IN::A,
+  message: Resolv::DNS::Message.decode(packet),
+  trust_anchors: [["example.", dnskey_rr]],
+)
+result.proof              #=> :nxdomain, :nodata, :wildcard_match,
+                          #    :insecure or :unprovable
+result.proved?            #=> true
+result.signatures_valid?  #=> true
+```
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake test` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.

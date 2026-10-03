@@ -3687,3 +3687,5 @@ class Resolv
   AddressRegex = /(?:#{IPv4::Regex})|(?:#{IPv6::Regex})/
 
 end
+
+require_relative 'resolv/dnssec'
